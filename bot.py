@@ -11,6 +11,8 @@ import os
 import re
 import time
 from datetime import datetime, timedelta
+from PIL import Image
+import pytesseract
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -43,6 +45,19 @@ ADMIN_IDS = _parse_ids(os.getenv("ADMIN_IDS", ""))
 ACCOUNTANT_IDS = _parse_ids(os.getenv("ACCOUNTANT_IDS", ""))
 WAREHOUSE_IDS = _parse_ids(os.getenv("WAREHOUSE_IDS", ""))
 DUPLICATE_ALERT_MINUTES = int(os.getenv("DUPLICATE_ALERT_MINUTES", "60"))
+
+# 1С подключение (OData)
+ODATA_URL = os.getenv("ODATA_URL", "")  # http://server/base/odata/standard.odata
+ODATA_USER = os.getenv("ODATA_USER", "")
+ODATA_PASS = os.getenv("ODATA_PASS", "")
+
+# OCR
+TESSERACT_PATH = os.getenv("TESSERACT_PATH", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+if os.path.exists(TESSERACT_PATH):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+# Язык интерфейса (ru/ky/en)
+DEFAULT_LANG = os.getenv("DEFAULT_LANG", "ru")
 
 try:
     import anthropic
@@ -1308,6 +1323,302 @@ def save_document(db: dict, doc: dict, collection: str, commit_msg: str) -> bool
 
 
 # ══════════════════════════════════════════════
+#  Поиск по документам
+# ══════════════════════════════════════════════
+
+def handle_doc_search(db, text):
+    """Поиск: 'найди операции с Альфа Трейд за сентябрь', 'последние 10 операций'."""
+    kw = ["найди","операци","документ","последни","послед","история","движени"]
+    if not any(k in text for k in kw):
+        return None
+
+    # Определяем период
+    period = parse_period(text)
+    date_from, date_to = period if period else (None, None)
+
+    # Определяем контрагента
+    search = clean_search(text, kw + ["за","период","все","контрагент","покупател","поставщик"])
+    found_c = find_contractor(db, search) if search else []
+
+    # Определяем лимит
+    limit_match = re.search(r'(\d+)\s*(?:последн|операц|документ|штук)', text)
+    limit = int(limit_match.group(1)) if limit_match else 10
+
+    # Собираем все документы
+    all_docs = []
+    for doc in db.get("bankDocuments", []):
+        dtype = doc.get("type", "")
+        direction = "Приход" if "in" in dtype or "pko" in dtype else "Расход"
+        all_docs.append({
+            "date": doc.get("date", ""), "number": doc.get("number", ""),
+            "type": direction, "sum": float(doc.get("sum", 0)),
+            "contractor": doc.get("contractor", ""),
+            "detail": doc.get("purpose", doc.get("note", "")),
+            "category": "bank",
+        })
+    for doc in db.get("cashDocuments", []):
+        dtype = doc.get("type", "")
+        direction = "Приход" if "in" in dtype or "pko" in dtype else "Расход"
+        all_docs.append({
+            "date": doc.get("date", ""), "number": doc.get("number", ""),
+            "type": direction, "sum": float(doc.get("sum", 0)),
+            "contractor": doc.get("contractor", ""),
+            "detail": doc.get("purpose", doc.get("note", "")),
+            "category": "cash",
+        })
+    for doc in db.get("trade", {}).get("docs", []):
+        dtype = doc.get("type", "")
+        direction = "Поступление" if dtype in _DOC_IN else "Реализация"
+        total = sum(float(r.get("total", 0)) for r in doc.get("rows", [])) or float(doc.get("total", 0))
+        items = ", ".join(f"{get_nom_name(db, r.get('nomenclature',''))} x{r.get('qty',0)}" for r in doc.get("rows", []))
+        all_docs.append({
+            "date": doc.get("date", ""), "number": doc.get("number", ""),
+            "type": direction, "sum": total,
+            "contractor": doc.get("contractor", ""),
+            "detail": items or doc.get("note", ""),
+            "category": "trade",
+        })
+
+    # Фильтруем
+    if found_c:
+        c_ids = {c["id"] for c in found_c}
+        all_docs = [d for d in all_docs if d["contractor"] in c_ids]
+    if date_from and date_to:
+        filtered = []
+        for d in all_docs:
+            try:
+                dd = datetime.strptime(d["date"][:10], "%Y-%m-%d").date()
+                if date_from <= dd <= date_to:
+                    filtered.append(d)
+            except ValueError:
+                pass
+        all_docs = filtered
+
+    all_docs.sort(key=lambda d: d["date"], reverse=True)
+    all_docs = all_docs[:limit]
+
+    if not all_docs:
+        return f"🔍 Документы не найдены\\."
+
+    lines = [f"🔍 {_bold('Найдено документов')}: {_esc(str(len(all_docs)))}\n"]
+    for d in all_docs:
+        c_name = get_contractor_name(db, d["contractor"]) if d["contractor"] else ""
+        line = f"  {_esc(d['date'])} \\| {_esc(d['number'])} \\| {_esc(d['type'])} {_bold(fmt(d['sum']) + ' сом')}"
+        if c_name:
+            line += f"\n    {_esc(c_name)}"
+        if d["detail"]:
+            line += f"\n    {_esc(d['detail'][:60])}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════
+#  Подключение к 1С (OData)
+# ══════════════════════════════════════════════
+
+def fetch_1c_data(entity: str, params: dict = None) -> list | None:
+    """Запрашивает данные из 1С через OData."""
+    if not ODATA_URL:
+        return None
+    try:
+        url = f"{ODATA_URL}/{entity}"
+        resp = requests.get(url, auth=(ODATA_USER, ODATA_PASS),
+                           params={"$format": "json", **(params or {})}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("value", data.get("d", {}).get("results", []))
+    except Exception as e:
+        log.error(f"1C OData error: {e}")
+        return None
+
+
+def handle_1c(db, text):
+    """Запросы к 1С: '1с остатки', '1с продажи', '1с контрагенты'."""
+    if not text.startswith("1с ") and not text.startswith("1c "):
+        return None
+    if not ODATA_URL:
+        return f"⚠️ 1С не подключена\\. Добавьте ODATA\\_URL в \\.env"
+
+    query = text[3:].strip()
+
+    if any(k in query for k in ["остат","склад","товар"]):
+        data = fetch_1c_data("AccumulationRegister_ОстаткиТоваров/Balance")
+        if data is None:
+            data = fetch_1c_data("InformationRegister_Цены")
+        if not data:
+            return f"📦 Нет данных из 1С или неверный endpoint\\."
+        lines = [f"📦 {_bold('Данные из 1С')}: {_esc(str(len(data)))} записей\n"]
+        for item in data[:20]:
+            name = item.get("Номенклатура_Key", item.get("Description", item.get("Ref_Key", "?")))
+            qty = item.get("КоличествоBalance", item.get("Количество", ""))
+            lines.append(f"  {_esc(str(name))}: {_esc(str(qty))}")
+        return "\n".join(lines)
+
+    if any(k in query for k in ["контрагент","клиент","поставщик"]):
+        data = fetch_1c_data("Catalog_Контрагенты", {"$top": "20", "$select": "Description,ИНН,КонтактнаяИнформация"})
+        if not data:
+            return f"🤝 Нет данных из 1С\\."
+        lines = [f"🤝 {_bold('Контрагенты из 1С')}\n"]
+        for item in data[:20]:
+            lines.append(f"  {_esc(item.get('Description', '?'))} \\| ИНН: {_esc(item.get('ИНН', '-'))}")
+        return "\n".join(lines)
+
+    if any(k in query for k in ["продаж","реализац","выручк"]):
+        data = fetch_1c_data("Document_РеализацияТоваровУслуг", {"$top": "10", "$orderby": "Date desc"})
+        if not data:
+            return f"📋 Нет данных из 1С\\."
+        lines = [f"📋 {_bold('Реализации из 1С')}\n"]
+        for item in data[:10]:
+            lines.append(f"  {_esc(item.get('Date','')[:10])} №{_esc(item.get('Number','?'))} — {_esc(str(item.get('СуммаДокумента',0)))} сом")
+        return "\n".join(lines)
+
+    if any(k in query for k in ["баланс","деньг","счёт","счет"]):
+        data = fetch_1c_data("AccumulationRegister_ДенежныеСредства/Balance")
+        if not data:
+            return f"💰 Нет данных из 1С\\."
+        lines = [f"💰 {_bold('Денежные средства из 1С')}\n"]
+        for item in data[:20]:
+            lines.append(f"  {_esc(str(item.get('БанковскийСчет_Key', item.get('Касса_Key', '?'))))}: {_esc(str(item.get('СуммаBalance', 0)))} сом")
+        return "\n".join(lines)
+
+    return (f"🏢 {_bold('Запросы к 1С')}:\n\n"
+            f"  {_esc('1с остатки')} — товары на складе\n"
+            f"  {_esc('1с контрагенты')} — список контрагентов\n"
+            f"  {_esc('1с продажи')} — реализации\n"
+            f"  {_esc('1с баланс')} — денежные средства")
+
+
+# ══════════════════════════════════════════════
+#  OCR: фото накладных
+# ══════════════════════════════════════════════
+
+def ocr_extract_text(image_bytes: bytes) -> str:
+    """Извлекает текст из изображения через Tesseract."""
+    img = Image.open(io.BytesIO(image_bytes))
+    text = pytesseract.image_to_string(img, lang="rus+eng")
+    return text.strip()
+
+
+def ocr_parse_invoice(text: str, db: dict) -> list[dict]:
+    """Пытается распознать строки накладной из OCR-текста."""
+    lines = text.split("\n")
+    results = []
+    noms = db.get("trade", {}).get("nomenclature", [])
+
+    for line in lines:
+        line = line.strip()
+        if not line or len(line) < 5:
+            continue
+        # Ищем паттерн: название ... кол-во ... цена ... сумма
+        m = re.search(r'(.+?)\s+(\d+)\s+[xхXХ*×]?\s*(\d[\d\s.,]*)', line)
+        if m:
+            name_part = m.group(1).strip()
+            qty = int(m.group(2))
+            price_str = m.group(3).replace(" ", "").replace(",", ".")
+            try:
+                price = float(price_str)
+            except ValueError:
+                continue
+            # Пытаемся найти в номенклатуре
+            matched = [n for n in noms if fuzzy_match(name_part, n.get("name", ""))]
+            results.append({
+                "raw": name_part,
+                "nom": matched[0] if matched else None,
+                "qty": qty,
+                "price": price,
+                "total": qty * price,
+            })
+            continue
+
+        # Альтернативный паттерн: название кол-во цена сумма (табличный)
+        parts = re.split(r'\s{2,}|\t', line)
+        if len(parts) >= 3:
+            name_part = parts[0]
+            nums = []
+            for p in parts[1:]:
+                p_clean = p.replace(" ", "").replace(",", ".")
+                try:
+                    nums.append(float(p_clean))
+                except ValueError:
+                    pass
+            if len(nums) >= 2:
+                qty = int(nums[0]) if nums[0] == int(nums[0]) else nums[0]
+                price = nums[1]
+                total = nums[2] if len(nums) >= 3 else qty * price
+                matched = [n for n in noms if fuzzy_match(name_part, n.get("name", ""))]
+                results.append({
+                    "raw": name_part,
+                    "nom": matched[0] if matched else None,
+                    "qty": qty,
+                    "price": price,
+                    "total": total,
+                })
+
+    return results
+
+
+# ══════════════════════════════════════════════
+#  Многоязычность
+# ══════════════════════════════════════════════
+
+_TRANSLATIONS = {
+    "ru": {
+        "greeting": "Здравствуйте, {name}! 👋\nЯ — бот бухгалтерии.",
+        "not_understood": "🤔 Не совсем понял вопрос.",
+        "no_data": "Нет данных.",
+        "confirm": "Подтвердить?",
+        "doc_created": "✅ Документ создан!",
+        "cancelled": "❌ Операция отменена.",
+        "access_denied": "🔒 У вас нет доступа к этому разделу.",
+        "choose_section": "Выберите раздел:",
+        "lang_set": "Язык установлен: Русский 🇷🇺",
+        "photo_processing": "📷 Обрабатываю фото...",
+        "photo_no_text": "Не удалось распознать текст на фото.",
+        "photo_no_items": "Не удалось найти позиции на накладной.",
+    },
+    "ky": {
+        "greeting": "Саламатсызбы, {name}! 👋\nМен бухгалтерия ботумун.",
+        "not_understood": "🤔 Суроону толук түшүнбөдүм.",
+        "no_data": "Маалымат жок.",
+        "confirm": "Ырастайсызбы?",
+        "doc_created": "✅ Документ түзүлдү!",
+        "cancelled": "❌ Операция жокко чыгарылды.",
+        "access_denied": "🔒 Бул бөлүмгө мүмкүнчүлүгүңүз жок.",
+        "choose_section": "Бөлүмдү тандаңыз:",
+        "lang_set": "Тил коюлду: Кыргызча 🇰🇬",
+        "photo_processing": "📷 Сүрөттү иштеп жатам...",
+        "photo_no_text": "Сүрөттөгү текстти таануу мүмкүн болбоду.",
+        "photo_no_items": "Накладнойдогу позицияларды табуу мүмкүн болбоду.",
+    },
+    "en": {
+        "greeting": "Hello, {name}! 👋\nI'm an accounting bot.",
+        "not_understood": "🤔 I didn't quite understand the question.",
+        "no_data": "No data.",
+        "confirm": "Confirm?",
+        "doc_created": "✅ Document created!",
+        "cancelled": "❌ Operation cancelled.",
+        "access_denied": "🔒 You don't have access to this section.",
+        "choose_section": "Choose a section:",
+        "lang_set": "Language set: English 🇬🇧",
+        "photo_processing": "📷 Processing photo...",
+        "photo_no_text": "Could not recognize text in the photo.",
+        "photo_no_items": "Could not find items in the invoice.",
+    },
+}
+
+# Хранение языка пользователя: {user_id: "ru"|"ky"|"en"}
+_user_langs: dict[int, str] = {}
+
+def t(user_id: int, key: str, **kwargs) -> str:
+    """Получить перевод для пользователя."""
+    lang = _user_langs.get(user_id, DEFAULT_LANG)
+    text = _TRANSLATIONS.get(lang, _TRANSLATIONS["ru"]).get(key, _TRANSLATIONS["ru"].get(key, key))
+    if kwargs:
+        text = text.format(**kwargs)
+    return text
+
+
+# ══════════════════════════════════════════════
 #  AI-ассистент (Claude)
 # ══════════════════════════════════════════════
 
@@ -1402,7 +1713,8 @@ def ask_ai(question: str, db: dict) -> str | None:
 # ══════════════════════════════════════════════
 
 HANDLERS = [
-    handle_summary, handle_period_report, handle_money, handle_debts, handle_price,
+    handle_summary, handle_doc_search, handle_1c, handle_period_report,
+    handle_money, handle_debts, handle_price,
     handle_payroll, handle_org, handle_contracts, handle_warehouses,
     handle_stock, handle_goods, handle_contractors, handle_employees,
 ]
@@ -1468,6 +1780,11 @@ HELP_MD = (
     f"  _расход 8000 на Бета Снаб с кассы_\n"
     f"  _поступление 5 ноутбуков от Бета Снаб_\n"
     f"  _реализация 3 мышек для Альфа Трейд_\n\n"
+    f"🔍 _Найди операции с Альфа Трейд за сентябрь_\n"
+    f"🔍 _Последние 10 операций_\n"
+    f"🏢 _1с остатки / 1с контрагенты / 1с продажи_\n"
+    f"📷 Отправьте фото накладной — распознаю\\!\n"
+    f"🌐 /lang — сменить язык \\(рус/кырг/eng\\)\n\n"
     f"Или нажмите кнопку ниже 👇"
 )
 
@@ -1478,15 +1795,13 @@ HELP_MD = (
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # Запоминаем chat_id для уведомлений
     chat_id = update.effective_chat.id
     if chat_id not in _notify_chat_ids:
         _notify_chat_ids.add(chat_id)
         log.info(f"Зарегистрирован chat_id для уведомлений: {chat_id}")
+    greeting = _esc(t(user.id, "greeting", name=user.first_name))
     await update.message.reply_text(
-        f"Здравствуйте, {_esc(user.first_name)}\\! 👋\n\n"
-        f"Я — бот бухгалтерии\\. Задайте вопрос или выберите раздел:\n\n"
-        + HELP_MD,
+        f"{greeting}\n\n{HELP_MD}",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=MAIN_MENU,
     )
@@ -1495,7 +1810,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_MD, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=MAIN_MENU)
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Выберите раздел:", reply_markup=MAIN_MENU)
+    await update.message.reply_text(t(update.effective_user.id, "choose_section"), reply_markup=MAIN_MENU)
+
+async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор языка: /lang"""
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang:ru"),
+         InlineKeyboardButton("🇰🇬 Кыргызча", callback_data="lang:ky"),
+         InlineKeyboardButton("🇬🇧 English", callback_data="lang:en")],
+    ])
+    await update.message.reply_text("🌐 Тилди тандаңыз / Выберите язык / Choose language:", reply_markup=kb)
 
 
 async def _send_chart(chat, chart_bytes: bytes | None, caption: str, no_data_msg: str):
@@ -1575,10 +1899,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.error(f"Confirm error: {e}")
             await query.message.edit_text("❌ Ошибка при сохранении.")
 
+    elif data.startswith("lang:"):
+        lang = data[5:]
+        _user_langs[query.from_user.id] = lang
+        msg = t(query.from_user.id, "lang_set")
+        await query.message.edit_text(msg)
+
     elif data.startswith("cancel:"):
         confirm_id = data[7:]
         context.user_data.pop(f"pending_{confirm_id}", None)
-        await query.message.edit_text("❌ Операция отменена.")
+        await query.message.edit_text(t(query.from_user.id, "cancelled"))
 
     elif data.startswith("xlsx:"):
         await chat.send_action(ChatAction.UPLOAD_DOCUMENT)
@@ -1748,6 +2078,85 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info(f"[ответ] {answer[:80]}...")
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фото накладных — OCR + парсинг."""
+    user = update.effective_user
+    uid = user.id
+    await update.message.reply_text(t(uid, "photo_processing"))
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    try:
+        photo = update.message.photo[-1]  # наибольший размер
+        file = await context.bot.get_file(photo.file_id)
+        buf = io.BytesIO()
+        await file.download_to_memory(buf)
+        image_bytes = buf.getvalue()
+
+        # OCR
+        text = ocr_extract_text(image_bytes)
+        if not text:
+            await update.message.reply_text(t(uid, "photo_no_text"))
+            return
+
+        log.info(f"[OCR {user.first_name}] {text[:100]}...")
+
+        # Парсинг позиций
+        db = fetch_db()
+        items = ocr_parse_invoice(text, db)
+
+        if not items:
+            # Просто показываем распознанный текст
+            await update.message.reply_text(
+                f"📷 {_bold('Распознанный текст')}:\n\n{_esc(text[:2000])}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        # Показываем найденные позиции
+        lines = [f"📷 {_bold('Распознано позиций')}: {_esc(str(len(items)))}\n"]
+        total_sum = 0
+        for i, item in enumerate(items, 1):
+            nom_name = item["nom"]["name"] if item["nom"] else item["raw"]
+            matched = "✅" if item["nom"] else "❓"
+            lines.append(f"  {matched} {_esc(nom_name)}: {_esc(str(item['qty']))} x {_bold(fmt(item['price']))} \\= {_bold(fmt(item['total']))} сом")
+            total_sum += item["total"]
+        lines.append(f"\n  Итого: {_bold(fmt(total_sum) + ' сом')}")
+
+        # Если все позиции найдены в номенклатуре — предложить создать документ
+        all_matched = all(item["nom"] for item in items)
+        if all_matched and has_permission(get_user_role(uid), "input_trade"):
+            confirm_id = str(uuid.uuid4())[:8]
+            rows = [{"nomenclature": item["nom"]["id"], "qty": item["qty"],
+                     "price": item["price"], "total": item["total"]} for item in items]
+            warehouses = db.get("trade", {}).get("warehouses", [])
+            wh_id = warehouses[0]["id"] if warehouses else "w1"
+            doc = {
+                "id": str(uuid.uuid4())[:8], "type": "postupleniye",
+                "number": f"OCR-{datetime.now().strftime('%H%M%S')}",
+                "date": datetime.now().strftime("%Y-%m-%d"), "status": "conducted",
+                "contractor": "", "contract": "", "warehouse": wh_id,
+                "note": "Создано из фото накладной (OCR)",
+                "rows": rows, "total": total_sum,
+                "created": datetime.now().isoformat() + "Z",
+            }
+            desc = f"Поступление из фото: {len(items)} позиций, {fmt(total_sum)} сом"
+            context.user_data[f"pending_{confirm_id}"] = (doc, "trade_docs", desc)
+            lines.append(f"\n📝 Создать поступление?")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Создать поступление", callback_data=f"confirm:{confirm_id}"),
+                 InlineKeyboardButton("❌ Отмена", callback_data=f"cancel:{confirm_id}")],
+            ])
+            await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+        else:
+            if not all_matched:
+                lines.append(f"\n❓ Позиции с ❓ не найдены в номенклатуре")
+            await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+
+    except Exception as e:
+        log.error(f"Photo OCR error: {e}")
+        await update.message.reply_text("⚠️ Ошибка при обработке фото.")
+
+
 # ══════════════════════════════════════════════
 #  Уведомления
 # ══════════════════════════════════════════════
@@ -1810,6 +2219,7 @@ async def post_init(app: Application):
         BotCommand("start", "Начать работу"),
         BotCommand("menu", "Главное меню"),
         BotCommand("help", "Справка"),
+        BotCommand("lang", "Сменить язык / Тил / Language"),
     ])
     log.info("Команды бота зарегистрированы")
 
@@ -1828,7 +2238,9 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Уведомления каждые 5 минут
