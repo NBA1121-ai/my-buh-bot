@@ -1619,6 +1619,333 @@ def t(user_id: int, key: str, **kwargs) -> str:
 
 
 # ══════════════════════════════════════════════
+#  Избранные запросы
+# ══════════════════════════════════════════════
+
+# {user_id: {"name": "query_text", ...}}
+_user_favorites: dict[int, dict[str, str]] = {}
+
+def save_favorite(user_id: int, name: str, query: str):
+    _user_favorites.setdefault(user_id, {})[name] = query
+
+def get_favorites(user_id: int) -> dict[str, str]:
+    return _user_favorites.get(user_id, {})
+
+def delete_favorite(user_id: int, name: str) -> bool:
+    favs = _user_favorites.get(user_id, {})
+    if name in favs:
+        del favs[name]
+        return True
+    return False
+
+
+# ══════════════════════════════════════════════
+#  Прогнозы
+# ══════════════════════════════════════════════
+
+def handle_forecast(db, text):
+    """Прогноз: 'прогноз расходов', 'прогноз на октябрь'."""
+    kw = ["прогноз","предсказ","ожидаем","планиру","будет расход","будет приход"]
+    if not any(k in text for k in kw):
+        return None
+
+    # Собираем помесячную статистику из всех документов
+    bank_docs = db.get("bankDocuments", [])
+    cash_docs = db.get("cashDocuments", [])
+    monthly_in = {}   # {YYYY-MM: сумма приходов}
+    monthly_out = {}  # {YYYY-MM: сумма расходов}
+
+    for doc in bank_docs + cash_docs:
+        d = doc.get("date", "")[:7]  # YYYY-MM
+        if not d or len(d) < 7:
+            continue
+        s = float(doc.get("sum", 0))
+        dtype = doc.get("type", "")
+        if dtype in ("payment_in", "cash_in", "pko"):
+            monthly_in[d] = monthly_in.get(d, 0) + s
+        elif dtype in ("payment_out", "cash_out", "rko"):
+            monthly_out[d] = monthly_out.get(d, 0) + s
+
+    # Торговые документы
+    monthly_trade_in = {}
+    monthly_trade_out = {}
+    for doc in db.get("trade", {}).get("docs", []):
+        d = doc.get("date", "")[:7]
+        if not d:
+            continue
+        total = sum(float(r.get("total", 0)) for r in doc.get("rows", [])) or float(doc.get("total", 0))
+        dtype = doc.get("type", "")
+        if dtype in _DOC_IN:
+            monthly_trade_in[d] = monthly_trade_in.get(d, 0) + total
+        elif dtype in _DOC_OUT:
+            monthly_trade_out[d] = monthly_trade_out.get(d, 0) + total
+
+    all_months = sorted(set(list(monthly_in.keys()) + list(monthly_out.keys()) +
+                            list(monthly_trade_in.keys()) + list(monthly_trade_out.keys())))
+
+    if len(all_months) < 1:
+        return f"📈 Недостаточно данных для прогноза\\. Нужна хотя бы 1 месяц истории\\."
+
+    # Средние
+    avg_in = sum(monthly_in.values()) / max(len(monthly_in), 1)
+    avg_out = sum(monthly_out.values()) / max(len(monthly_out), 1)
+    avg_trade_in = sum(monthly_trade_in.values()) / max(len(monthly_trade_in), 1)
+    avg_trade_out = sum(monthly_trade_out.values()) / max(len(monthly_trade_out), 1)
+
+    # Тренд (последний месяц vs средний)
+    if all_months:
+        last = all_months[-1]
+        last_in = monthly_in.get(last, 0)
+        last_out = monthly_out.get(last, 0)
+        trend_in = "📈" if last_in > avg_in else "📉" if last_in < avg_in else "➡️"
+        trend_out = "📈" if last_out > avg_out else "📉" if last_out < avg_out else "➡️"
+    else:
+        trend_in = trend_out = "➡️"
+
+    lines = [f"🔮 {_bold('Прогноз')}\n"]
+    lines.append(f"📊 На основе {_esc(str(len(all_months)))} мес\\. данных\n")
+
+    lines.append(f"💰 {_bold('Денежные потоки')} \\(среднемесячные\\)")
+    lines.append(f"  {trend_in} Приходы: ~{_bold(fmt(avg_in) + ' сом')}/мес")
+    lines.append(f"  {trend_out} Расходы: ~{_bold(fmt(avg_out) + ' сом')}/мес")
+    diff = avg_in - avg_out
+    lines.append(f"  {'🟢' if diff >= 0 else '🔴'} Остаток: ~{_bold(fmt(diff) + ' сом')}/мес\n")
+
+    if avg_trade_in or avg_trade_out:
+        lines.append(f"📦 {_bold('Торговля')} \\(среднемесячные\\)")
+        lines.append(f"  Закупки: ~{_bold(fmt(avg_trade_in) + ' сом')}/мес")
+        lines.append(f"  Продажи: ~{_bold(fmt(avg_trade_out) + ' сом')}/мес")
+        margin = avg_trade_out - avg_trade_in
+        lines.append(f"  Маржа: ~{_bold(fmt(margin) + ' сом')}/мес\n")
+
+    # Прогноз баланса через 1/3/6 месяцев
+    bal = calc_balances(db)
+    current = sum(bal.values())
+    lines.append(f"💵 {_bold('Прогноз баланса')}")
+    lines.append(f"  Сейчас: {_bold(fmt(current) + ' сом')}")
+    for months, label in [(1, "1 мес"), (3, "3 мес"), (6, "6 мес")]:
+        projected = current + diff * months
+        lines.append(f"  Через {_esc(label)}: ~{_bold(fmt(projected) + ' сом')}")
+
+    lines.append(f"\n⚠️ {_esc('Прогноз на основе средних значений, не учитывает сезонность')}")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════
+#  Сравнение периодов
+# ══════════════════════════════════════════════
+
+def handle_compare(db, text):
+    """Сравнение: 'сравни сентябрь с августом', 'сравни эту неделю с прошлой'."""
+    if "сравни" not in text and "сравнени" not in text:
+        return None
+
+    # Ищем два периода через "с"/"и"/"vs"
+    parts = re.split(r'\s+(?:с|и|vs|versus)\s+', text.replace("сравни ", "").replace("сравнение ", ""))
+    if len(parts) < 2:
+        # Попробуем "эту неделю с прошлой"
+        if "эт" in text and "прошл" in text:
+            if "недел" in text:
+                today = datetime.now().date()
+                this_start = today - timedelta(days=today.weekday())
+                parts = ["эту неделю", "прошлую неделю"]
+            elif "месяц" in text:
+                parts = ["этот месяц", "прошлый месяц"]
+            else:
+                return f"🔄 Укажите два периода: {_esc('сравни сентябрь с августом')}"
+        else:
+            return f"🔄 Укажите два периода: {_esc('сравни сентябрь с августом')}"
+
+    p1 = parse_period(parts[0].strip())
+    p2 = parse_period(parts[1].strip())
+    if not p1 or not p2:
+        return f"🔄 Не удалось распознать периоды\\. Пример: {_esc('сравни сентябрь с августом')}"
+
+    def _calc_period(date_from, date_to):
+        bank_docs = filter_docs_by_period(db.get("bankDocuments", []), date_from, date_to)
+        cash_docs = filter_docs_by_period(db.get("cashDocuments", []), date_from, date_to)
+        trade_docs = filter_docs_by_period(db.get("trade", {}).get("docs", []), date_from, date_to)
+        income = sum(float(d.get("sum", 0)) for d in bank_docs + cash_docs if d.get("type") in ("payment_in", "cash_in", "pko"))
+        expense = sum(float(d.get("sum", 0)) for d in bank_docs + cash_docs if d.get("type") in ("payment_out", "cash_out", "rko"))
+        trade_in = sum(sum(float(r.get("total", 0)) for r in d.get("rows", [])) for d in trade_docs if d.get("type") in _DOC_IN)
+        trade_out = sum(sum(float(r.get("total", 0)) for r in d.get("rows", [])) for d in trade_docs if d.get("type") in _DOC_OUT)
+        return {"income": income, "expense": expense, "trade_in": trade_in, "trade_out": trade_out,
+                "docs": len(bank_docs) + len(cash_docs) + len(trade_docs)}
+
+    d1 = _calc_period(p1[0], p1[1])
+    d2 = _calc_period(p2[0], p2[1])
+
+    def _arrow(new, old):
+        if old == 0:
+            return "🆕" if new > 0 else "➡️"
+        pct = ((new - old) / old) * 100
+        if pct > 5:
+            return f"📈 \\+{_esc(f'{pct:.0f}')}%"
+        elif pct < -5:
+            return f"📉 {_esc(f'{pct:.0f}')}%"
+        return "➡️ ~0%"
+
+    p1_str = f"{p1[0].strftime('%d.%m')}—{p1[1].strftime('%d.%m.%Y')}"
+    p2_str = f"{p2[0].strftime('%d.%m')}—{p2[1].strftime('%d.%m.%Y')}"
+
+    lines = [f"🔄 {_bold('Сравнение периодов')}\n"]
+    lines.append(f"  📅 A: {_esc(p1_str)}")
+    lines.append(f"  📅 B: {_esc(p2_str)}\n")
+
+    lines.append(f"  {'─'*30}")
+    lines.append(f"  {'':>20} {'A':>10} {'B':>10}")
+    lines.append(f"  {'─'*30}\n")
+
+    lines.append(f"💰 {_bold('Приходы')}")
+    lines.append(f"  A: {_bold(fmt(d1['income']) + ' сом')}")
+    lines.append(f"  B: {_bold(fmt(d2['income']) + ' сом')}  {_arrow(d1['income'], d2['income'])}\n")
+
+    lines.append(f"💸 {_bold('Расходы')}")
+    lines.append(f"  A: {_bold(fmt(d1['expense']) + ' сом')}")
+    lines.append(f"  B: {_bold(fmt(d2['expense']) + ' сом')}  {_arrow(d1['expense'], d2['expense'])}\n")
+
+    if d1["trade_out"] or d2["trade_out"]:
+        lines.append(f"📦 {_bold('Продажи')}")
+        lines.append(f"  A: {_bold(fmt(d1['trade_out']) + ' сом')}")
+        lines.append(f"  B: {_bold(fmt(d2['trade_out']) + ' сом')}  {_arrow(d1['trade_out'], d2['trade_out'])}\n")
+
+    if d1["trade_in"] or d2["trade_in"]:
+        lines.append(f"📥 {_bold('Закупки')}")
+        lines.append(f"  A: {_bold(fmt(d1['trade_in']) + ' сом')}")
+        lines.append(f"  B: {_bold(fmt(d2['trade_in']) + ' сом')}  {_arrow(d1['trade_in'], d2['trade_in'])}\n")
+
+    lines.append(f"📝 Документов: A\\={_esc(str(d1['docs']))}, B\\={_esc(str(d2['docs']))}")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════
+#  Топ-отчёты
+# ══════════════════════════════════════════════
+
+def handle_top(db, text):
+    """Топ: 'топ товаров', 'топ контрагентов по обороту', 'топ 5 продаж'."""
+    if "топ" not in text and "рейтинг" not in text and "лучш" not in text:
+        return None
+
+    # Количество
+    m = re.search(r'(\d+)', text)
+    limit = int(m.group(1)) if m else 5
+
+    # Тип топа
+    if any(k in text for k in ["товар","продаж","номенклатур","продукц"]):
+        return _top_products(db, limit, text)
+    elif any(k in text for k in ["контрагент","клиент","покупател","поставщик","оборот"]):
+        return _top_contractors(db, limit, text)
+    elif any(k in text for k in ["расход","затрат","стат"]):
+        return _top_expenses(db, limit)
+    elif any(k in text for k in ["сотрудник","зарплат"]):
+        return _top_employees(db, limit)
+
+    # По умолчанию — товары
+    return _top_products(db, limit, text)
+
+
+def _top_products(db, limit, text):
+    """Топ товаров по продажам."""
+    sales = {}
+    for doc in db.get("trade", {}).get("docs", []):
+        if doc.get("type") not in _DOC_OUT:
+            continue
+        for row in doc.get("rows", []):
+            nid = row.get("nomenclature", row.get("nom", ""))
+            if nid:
+                total = float(row.get("total", 0))
+                qty = float(row.get("qty", 0))
+                sales.setdefault(nid, {"sum": 0, "qty": 0})
+                sales[nid]["sum"] += total
+                sales[nid]["qty"] += qty
+
+    if not sales:
+        return f"🏆 Нет данных по продажам\\."
+
+    by_sum = "количеств" not in text
+    sorted_items = sorted(sales.items(), key=lambda x: -x[1]["sum" if by_sum else "qty"])[:limit]
+
+    metric = "по сумме" if by_sum else "по количеству"
+    lines = [f"🏆 {_bold(f'Топ-{limit} товаров')} \\({_esc(metric)}\\)\n"]
+    for i, (nid, data) in enumerate(sorted_items, 1):
+        name = get_nom_name(db, nid)
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}\\."
+        lines.append(f"  {medal} {_esc(name)}")
+        lines.append(f"      {_bold(fmt(data['sum']) + ' сом')} \\({_esc(fmt(data['qty']))} шт\\)")
+    return "\n".join(lines)
+
+
+def _top_contractors(db, limit, text):
+    """Топ контрагентов по обороту."""
+    turnover = {}
+    for doc in db.get("trade", {}).get("docs", []):
+        c_id = doc.get("contractor", "")
+        if not c_id:
+            continue
+        total = sum(float(r.get("total", 0)) for r in doc.get("rows", [])) or float(doc.get("total", 0))
+        turnover[c_id] = turnover.get(c_id, 0) + total
+    for doc in db.get("bankDocuments", []) + db.get("cashDocuments", []):
+        c_id = doc.get("contractor", "")
+        if not c_id:
+            continue
+        turnover[c_id] = turnover.get(c_id, 0) + float(doc.get("sum", 0))
+
+    if not turnover:
+        return f"🏆 Нет данных по контрагентам\\."
+
+    sorted_items = sorted(turnover.items(), key=lambda x: -x[1])[:limit]
+    lines = [f"🏆 {_bold(f'Топ-{limit} контрагентов')} \\(по обороту\\)\n"]
+    for i, (c_id, total) in enumerate(sorted_items, 1):
+        name = get_contractor_name(db, c_id)
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}\\."
+        lines.append(f"  {medal} {_esc(name)}: {_bold(fmt(total) + ' сом')}")
+    return "\n".join(lines)
+
+
+def _top_expenses(db, limit):
+    """Топ статей расходов."""
+    articles = {}
+    article_names = {a["id"]: a["name"] for a in db.get("articles", [])}
+    for doc in db.get("bankDocuments", []) + db.get("cashDocuments", []):
+        dtype = doc.get("type", "")
+        if dtype not in ("payment_out", "cash_out", "rko"):
+            continue
+        art = doc.get("article", "")
+        name = article_names.get(art, art or "Без статьи")
+        articles[name] = articles.get(name, 0) + float(doc.get("sum", 0))
+
+    if not articles:
+        return f"🏆 Нет данных по расходам\\."
+
+    sorted_items = sorted(articles.items(), key=lambda x: -x[1])[:limit]
+    total_exp = sum(v for v in articles.values())
+
+    lines = [f"🏆 {_bold(f'Топ-{limit} статей расходов')}\n"]
+    for i, (name, amount) in enumerate(sorted_items, 1):
+        pct = (amount / total_exp * 100) if total_exp else 0
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}\\."
+        lines.append(f"  {medal} {_esc(name)}: {_bold(fmt(amount) + ' сом')} \\({_esc(f'{pct:.0f}')}%\\)")
+    return "\n".join(lines)
+
+
+def _top_employees(db, limit):
+    """Топ сотрудников по зарплате."""
+    employees = db.get("trade", {}).get("employees", [])
+    if not employees:
+        return f"🏆 Нет данных по сотрудникам\\."
+
+    sorted_emps = sorted(employees, key=lambda e: -e.get("salary", 0))[:limit]
+    lines = [f"🏆 {_bold(f'Топ-{limit} сотрудников')} \\(по окладу\\)\n"]
+    for i, e in enumerate(sorted_emps, 1):
+        pos = get_position_name(db, e.get("position", ""))
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}\\."
+        lines.append(f"  {medal} {_esc(e.get('name', '?'))} — {_esc(pos)}")
+        lines.append(f"      {_bold(fmt(e.get('salary', 0)) + ' сом')}")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════
 #  AI-ассистент (Claude)
 # ══════════════════════════════════════════════
 
@@ -1714,6 +2041,7 @@ def ask_ai(question: str, db: dict) -> str | None:
 
 HANDLERS = [
     handle_summary, handle_doc_search, handle_1c, handle_period_report,
+    handle_forecast, handle_compare, handle_top,
     handle_money, handle_debts, handle_price,
     handle_payroll, handle_org, handle_contracts, handle_warehouses,
     handle_stock, handle_goods, handle_contractors, handle_employees,
@@ -1760,6 +2088,9 @@ MAIN_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("📥 Excel: Балансы", callback_data="xlsx:balances"),
      InlineKeyboardButton("📥 Excel: Склад", callback_data="xlsx:stock")],
     [InlineKeyboardButton("📥 Excel: Долги", callback_data="xlsx:debts")],
+    [InlineKeyboardButton("📈 Прогноз", callback_data="q:прогноз"),
+     InlineKeyboardButton("🏆 Топ товаров", callback_data="q:топ товаров")],
+    [InlineKeyboardButton("⭐ Избранное", callback_data="cmd:fav")],
 ])
 
 HELP_MD = (
@@ -1785,6 +2116,11 @@ HELP_MD = (
     f"🏢 _1с остатки / 1с контрагенты / 1с продажи_\n"
     f"📷 Отправьте фото накладной — распознаю\\!\n"
     f"🌐 /lang — сменить язык \\(рус/кырг/eng\\)\n\n"
+    f"📈 _Прогноз / Прогноз баланса_\n"
+    f"📊 _Сравни сентябрь с августом_\n"
+    f"🏆 _Топ товаров / Топ контрагентов / Топ расходов_\n\n"
+    f"⭐ /save \\<имя\\> — сохранить последний запрос\n"
+    f"⭐ /fav — список избранных запросов\n\n"
     f"Или нажмите кнопку ниже 👇"
 )
 
@@ -1820,6 +2156,39 @@ async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🇬🇧 English", callback_data="lang:en")],
     ])
     await update.message.reply_text("🌐 Тилди тандаңыз / Выберите язык / Choose language:", reply_markup=kb)
+
+# Последний запрос пользователя (для /save)
+_last_user_query: dict[int, str] = {}
+
+async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохранить последний запрос в избранное: /save <имя>"""
+    uid = update.effective_user.id
+    name = " ".join(context.args).strip() if context.args else ""
+    if not name:
+        await update.message.reply_text("⭐ Использование: /save <имя>\nНапример: /save Баланс")
+        return
+    last_q = _last_user_query.get(uid)
+    if not last_q:
+        await update.message.reply_text("❌ Сначала задайте вопрос, потом сохраните его командой /save")
+        return
+    save_favorite(uid, name, last_q)
+    await update.message.reply_text(f"⭐ Сохранено: *{_esc(name)}* → _{_esc(last_q)}_", parse_mode=ParseMode.MARKDOWN_V2)
+
+async def cmd_fav(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список избранных запросов: /fav"""
+    uid = update.effective_user.id
+    favs = get_favorites(uid)
+    if not favs:
+        await update.message.reply_text("⭐ У вас пока нет избранных запросов.\nИспользуйте /save <имя> после любого вопроса.")
+        return
+    buttons = []
+    for name, query in favs.items():
+        buttons.append([
+            InlineKeyboardButton(f"⭐ {name}", callback_data=f"fav:{name}"),
+            InlineKeyboardButton("🗑", callback_data=f"delfav:{name}"),
+        ])
+    kb = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text("⭐ *Избранные запросы:*", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
 
 
 async def _send_chart(chat, chart_bytes: bytes | None, caption: str, no_data_msg: str):
@@ -1909,6 +2278,46 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         confirm_id = data[7:]
         context.user_data.pop(f"pending_{confirm_id}", None)
         await query.message.edit_text(t(query.from_user.id, "cancelled"))
+
+    elif data.startswith("fav:"):
+        fav_name = data[4:]
+        uid = query.from_user.id
+        favs = get_favorites(uid)
+        fav_query = favs.get(fav_name)
+        if not fav_query:
+            await query.message.edit_text("❌ Избранный запрос не найден.")
+            return
+        await chat.send_action(ChatAction.TYPING)
+        answer = process_question(fav_query)
+        if not answer:
+            answer = "Нет данных по этому запросу\\."
+        try:
+            await query.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=MAIN_MENU)
+        except Exception:
+            await query.message.reply_text(answer.replace("\\", ""), reply_markup=MAIN_MENU)
+
+    elif data.startswith("delfav:"):
+        fav_name = data[7:]
+        uid = query.from_user.id
+        if delete_favorite(uid, fav_name):
+            await query.message.edit_text(f"🗑 Удалено: {fav_name}")
+        else:
+            await query.message.edit_text("❌ Запрос не найден.")
+
+    elif data == "cmd:fav":
+        uid = query.from_user.id
+        favs = get_favorites(uid)
+        if not favs:
+            await chat.send_message("⭐ У вас пока нет избранных запросов.\nИспользуйте /save <имя> после любого вопроса.")
+            return
+        buttons = []
+        for name, q in favs.items():
+            buttons.append([
+                InlineKeyboardButton(f"⭐ {name}", callback_data=f"fav:{name}"),
+                InlineKeyboardButton("🗑", callback_data=f"delfav:{name}"),
+            ])
+        kb = InlineKeyboardMarkup(buttons)
+        await chat.send_message("⭐ *Избранные запросы:*", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
 
     elif data.startswith("xlsx:"):
         await chat.send_action(ChatAction.UPLOAD_DOCUMENT)
@@ -2047,6 +2456,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Обычный текстовый ответ ──
     answer = process_question(text)
+    if answer:
+        _last_user_query[user_id] = text
     if not answer:
         answer = f"🤔 Не совсем понял вопрос\\.\n\n{HELP_MD}"
 
@@ -2220,6 +2631,8 @@ async def post_init(app: Application):
         BotCommand("menu", "Главное меню"),
         BotCommand("help", "Справка"),
         BotCommand("lang", "Сменить язык / Тил / Language"),
+        BotCommand("save", "Сохранить запрос в избранное"),
+        BotCommand("fav", "Избранные запросы"),
     ])
     log.info("Команды бота зарегистрированы")
 
@@ -2239,6 +2652,8 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("lang", cmd_lang))
+    app.add_handler(CommandHandler("save", cmd_save))
+    app.add_handler(CommandHandler("fav", cmd_fav))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
