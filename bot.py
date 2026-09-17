@@ -1,12 +1,7 @@
 """
 Telegram-бот для my-buh
-Читает db.json из GitHub (ветка data) и отвечает на вопросы:
-- остатки на складе
-- деньги на счетах
-- долги контрагентов
-- цены товаров
-- информация о сотрудниках, контрагентах, организации
-- зарплатные настройки
+Читает db.json из GitHub (ветка data) и отвечает на вопросы
+о складе, финансах, контрагентах, сотрудниках и т.д.
 """
 
 import json
@@ -16,30 +11,36 @@ import re
 import time
 import requests
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    filters, ContextTypes,
+)
+from telegram.constants import ParseMode, ChatAction
 
 load_dotenv()
 
-# ============ НАСТРОЙКИ (из .env) ============
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "")
 DATA_BRANCH = os.getenv("DATA_BRANCH", "data")
 DATA_FILE = os.getenv("DATA_FILE", "db.json")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-# ==============================================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
 log = logging.getLogger(__name__)
 
 
-# =============================================
-# Загрузка данных
-# =============================================
+# ══════════════════════════════════════════════
+#  Загрузка данных с кэшированием
+# ══════════════════════════════════════════════
 
 _db_cache = None
 _db_cache_time = 0
-DB_CACHE_TTL = 60  # кэш на 60 секунд
+DB_CACHE_TTL = 60
 
 def fetch_db() -> dict:
     global _db_cache, _db_cache_time
@@ -57,19 +58,19 @@ def fetch_db() -> dict:
     return _db_cache
 
 
-# =============================================
-# Вспомогательные: стемминг, поиск, форматирование
-# =============================================
+# ══════════════════════════════════════════════
+#  Стемминг, поиск, форматирование
+# ══════════════════════════════════════════════
 
 def stem(word: str) -> str:
     if len(word) <= 3:
         return word
-    for suffix in ["ами", "ями", "ов", "ев", "ей", "ах", "ях", "ом", "ем",
-                    "ой", "ей", "ам", "ям", "ий", "ый", "ая", "яя", "ое",
-                    "ее", "ую", "юю", "ые", "ие", "ок", "ек", "ик",
-                    "а", "я", "о", "е", "у", "ю", "ы", "и"]:
-        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
-            return word[:-len(suffix)]
+    for suf in ["ами","ями","ов","ев","ей","ах","ях","ом","ем",
+                "ой","ей","ам","ям","ий","ый","ая","яя","ое",
+                "ее","ую","юю","ые","ие","ок","ек","ик",
+                "а","я","о","е","у","ю","ы","и"]:
+        if word.endswith(suf) and len(word) - len(suf) >= 3:
+            return word[:-len(suf)]
     return word
 
 
@@ -91,138 +92,111 @@ def fmt(n: float) -> str:
     return f"{n:,.2f}".replace(",", " ")
 
 
+_STOP_WORDS = {
+    "на","у","нас","в","по","мне","нам","ещё","еще","мы","я","он","они",
+    "есть","ли","же","бы","не","и","а","то","от","до","за","из","об",
+    "что","как","где","кто","чей","это","вот","тот","так","там",
+    "всё","все","весь","общий","общие","итого","только","уже",
+    "скажи","покажи","подскажи","расскажи","напиши","дай","выведи",
+    "пожалуйста","можно","нужно","хочу","знать","узнать",
+    "какой","какая","какие","каков","сколько","много",
+}
+
 def clean_search(text: str, extra_stops: list = None) -> str:
-    """Убирает пунктуацию и стоп-слова, возвращает чистый поисковый запрос."""
     text = re.sub(r'[?!.,;:\-—–()\"\'\«\»]', ' ', text.lower())
-    stops = {
-        "на", "у", "нас", "в", "по", "мне", "нам", "ещё", "еще", "мы", "я", "он", "они",
-        "есть", "ли", "же", "бы", "не", "и", "а", "то", "от", "до", "за", "из", "об",
-        "что", "как", "где", "кто", "чей", "это", "вот", "тот", "так", "там",
-        "всё", "все", "весь", "общий", "общие", "итого", "только", "ещё", "уже",
-        "скажи", "покажи", "подскажи", "расскажи", "напиши", "дай", "выведи",
-        "пожалуйста", "можно", "нужно", "хочу", "знать", "узнать",
-        "какой", "какая", "какие", "каков", "сколько", "много",
-    }
+    stops = set(_STOP_WORDS)
     if extra_stops:
         for w in extra_stops:
             stops.add(w)
             stops.add(stem(w))
-    words = [w for w in text.split() if w not in stops and stem(w) not in stops and len(w) > 1]
-    return " ".join(words)
+    return " ".join(w for w in text.split() if w not in stops and stem(w) not in stops and len(w) > 1)
 
 
-# =============================================
-# Справочники: получение имён по ID
-# =============================================
+# ══════════════════════════════════════════════
+#  Справочники → имена по ID
+# ══════════════════════════════════════════════
+
+def _lookup(items, item_id, field="name"):
+    for item in items:
+        if item.get("id") == item_id:
+            return item.get(field, item_id)
+    return item_id
 
 def get_account_name(db, acc_id):
-    """acc_id может быть 'bank:_1' или 'cash:_1' или просто '_1'."""
-    raw_id = acc_id.split(":", 1)[-1] if ":" in acc_id else acc_id
+    raw = acc_id.split(":", 1)[-1] if ":" in acc_id else acc_id
     prefix = acc_id.split(":", 1)[0] if ":" in acc_id else ""
-    # Для кассовых документов — ищем сначала в кассах
     if prefix == "cash":
-        for c in db.get("cashs", []):
-            if c["id"] == raw_id:
-                return c.get("name", raw_id)
-    # Для банковских — в счетах
-    for a in db.get("accounts", []):
-        if a["id"] == raw_id:
-            return a.get("name", raw_id)
-    return raw_id or "Без счёта"
+        name = _lookup(db.get("cashs", []), raw)
+        if name != raw:
+            return name
+    name = _lookup(db.get("accounts", []), raw)
+    return name if name != raw else (raw or "Без счёта")
 
 def get_warehouse_name(db, wh_id):
-    for w in db.get("trade", {}).get("warehouses", []):
-        if w["id"] == wh_id:
-            return w.get("name", wh_id)
-    return wh_id or "Без склада"
+    return _lookup(db.get("trade", {}).get("warehouses", []), wh_id) if wh_id else "Без склада"
 
 def get_contractor_name(db, c_id):
-    for c in db.get("trade", {}).get("contractors", []):
-        if c["id"] == c_id:
-            return c.get("name", c_id)
-    return c_id
+    return _lookup(db.get("trade", {}).get("contractors", []), c_id)
 
 def get_position_name(db, pos_id):
-    for p in db.get("trade", {}).get("positions", []):
-        if p["id"] == pos_id:
-            return p.get("name", pos_id)
-    return pos_id
-
-def get_nom_name(db, nom_id):
-    for n in db.get("trade", {}).get("nomenclature", []):
-        if n["id"] == nom_id:
-            return n.get("name", nom_id)
-    return nom_id
+    return _lookup(db.get("trade", {}).get("positions", []), pos_id)
 
 
-# =============================================
-# Вычисления
-# =============================================
+# ══════════════════════════════════════════════
+#  Вычисления
+# ══════════════════════════════════════════════
+
+_DOC_IN  = {"prihod","postupleniye","receipt","purchase","vozvrat_pokup"}
+_DOC_OUT = {"rashod","realizaciya","sale","shipment","vozvrat_post","spisaniye"}
 
 def calc_stock(db):
     stock = {}
     for doc in db.get("trade", {}).get("docs", []):
         dtype = doc.get("type", "")
-        is_in = dtype in ("prihod", "postupleniye", "receipt", "purchase", "vozvrat_pokup")
-        is_out = dtype in ("rashod", "realizaciya", "sale", "shipment", "vozvrat_post", "spisaniye")
+        is_in, is_out = dtype in _DOC_IN, dtype in _DOC_OUT
         if not is_in and not is_out:
             continue
         wh = doc.get("warehouse", doc.get("warehouseFrom", ""))
         for row in doc.get("rows", []):
-            nom_id = row.get("nomenclature", row.get("nom", ""))
+            nid = row.get("nomenclature", row.get("nom", ""))
             qty = float(row.get("qty", row.get("quantity", 0)))
             if is_out:
                 qty = -qty
-            if nom_id:
-                stock.setdefault(nom_id, {})
-                stock[nom_id][wh] = stock[nom_id].get(wh, 0) + qty
+            if nid:
+                stock.setdefault(nid, {})
+                stock[nid][wh] = stock[nid].get(wh, 0) + qty
     return stock
 
 
 def calc_balances(db):
-    """Возвращает { 'bank:_1': сумма, 'cash:_1': сумма } — ключи с префиксом чтобы не путать банк и кассу."""
-    balances = {}
+    bal = {}
     for doc in db.get("bankDocuments", []):
         key = "bank:" + doc.get("account", "")
         s = float(doc.get("sum", 0))
-        if doc.get("type") == "payment_in":
-            balances[key] = balances.get(key, 0) + s
-        elif doc.get("type") == "payment_out":
-            balances[key] = balances.get(key, 0) - s
+        if doc["type"] == "payment_in":    bal[key] = bal.get(key, 0) + s
+        elif doc["type"] == "payment_out": bal[key] = bal.get(key, 0) - s
     for doc in db.get("cashDocuments", []):
         key = "cash:" + doc.get("cash", doc.get("account", ""))
         s = float(doc.get("sum", 0))
-        if doc.get("type") in ("cash_in", "pko"):
-            balances[key] = balances.get(key, 0) + s
-        elif doc.get("type") in ("cash_out", "rko"):
-            balances[key] = balances.get(key, 0) - s
-    return balances
+        if doc["type"] in ("cash_in", "pko"):    bal[key] = bal.get(key, 0) + s
+        elif doc["type"] in ("cash_out", "rko"): bal[key] = bal.get(key, 0) - s
+    return bal
 
 
-def calc_contractor_debts(db):
-    """
-    Считает долги контрагентов по торговым + банковским документам.
-    Реализация (sale/realizaciya) -> контрагент должен нам
-    Оплата от покупателя (payment_in с contractor) -> контрагент заплатил
-    Поступление (purchase/prihod) -> мы должны контрагенту
-    Оплата поставщику (payment_out с contractor) -> мы заплатили
-    Возвращает: { contractor_id: сумма } (+ = нам должны, - = мы должны)
-    """
+def calc_debts(db):
     debts = {}
-    # Торговые документы
     for doc in db.get("trade", {}).get("docs", []):
-        dtype = doc.get("type", "")
         c_id = doc.get("contractor", "")
         if not c_id:
             continue
         total = sum(float(r.get("total", r.get("sum", 0))) for r in doc.get("rows", []))
         if not total:
             total = float(doc.get("total", doc.get("sum", 0)))
+        dtype = doc.get("type", "")
         if dtype in ("realizaciya", "sale", "shipment"):
-            debts[c_id] = debts.get(c_id, 0) + total  # нам должны
+            debts[c_id] = debts.get(c_id, 0) + total
         elif dtype in ("postupleniye", "prihod", "purchase", "receipt"):
-            debts[c_id] = debts.get(c_id, 0) - total  # мы должны
-    # Банковские документы с контрагентом
+            debts[c_id] = debts.get(c_id, 0) - total
     for doc in db.get("bankDocuments", []) + db.get("cashDocuments", []):
         c_id = doc.get("contractor", "")
         if not c_id:
@@ -230,431 +204,405 @@ def calc_contractor_debts(db):
         s = float(doc.get("sum", 0))
         dtype = doc.get("type", "")
         if dtype in ("payment_in", "cash_in", "pko"):
-            debts[c_id] = debts.get(c_id, 0) - s  # нам заплатили
+            debts[c_id] = debts.get(c_id, 0) - s
         elif dtype in ("payment_out", "cash_out", "rko"):
-            debts[c_id] = debts.get(c_id, 0) + s  # мы заплатили (наш долг уменьшился)
+            debts[c_id] = debts.get(c_id, 0) + s
     return debts
 
 
-# =============================================
-# Поиск
-# =============================================
+# ══════════════════════════════════════════════
+#  Поиск
+# ══════════════════════════════════════════════
 
-def find_nomenclature(db, query):
-    return [n for n in db.get("trade", {}).get("nomenclature", [])
-            if fuzzy_match(query, n.get("name", ""))]
+def find_nomenclature(db, q):
+    return [n for n in db.get("trade",{}).get("nomenclature",[]) if fuzzy_match(q, n.get("name",""))]
 
-def find_contractor(db, query):
-    return [c for c in db.get("trade", {}).get("contractors", [])
-            if fuzzy_match(query, c.get("name", "") + " " + c.get("full", ""))]
+def find_contractor(db, q):
+    return [c for c in db.get("trade",{}).get("contractors",[]) if fuzzy_match(q, c.get("name","")+" "+c.get("full",""))]
 
-def find_employee(db, query):
-    return [e for e in db.get("trade", {}).get("employees", [])
-            if fuzzy_match(query, e.get("name", ""))]
+def find_employee(db, q):
+    return [e for e in db.get("trade",{}).get("employees",[]) if fuzzy_match(q, e.get("name",""))]
 
 
-# =============================================
-# Обработчики вопросов (каждый возвращает str или None)
-# =============================================
+# ══════════════════════════════════════════════
+#  Форматирование ответов (Telegram Markdown)
+# ══════════════════════════════════════════════
+
+def _esc(text: str) -> str:
+    """Экранирует спецсимволы MarkdownV2."""
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!\\])', r'\\\1', str(text))
+
+def _bold(text: str) -> str:
+    return f"*{_esc(text)}*"
+
+def _line(label: str, value: str) -> str:
+    return f"  {_esc(label)}: {_bold(value)}"
+
+
+# ══════════════════════════════════════════════
+#  Обработчики вопросов
+# ══════════════════════════════════════════════
+
+def handle_summary(db, text):
+    kw = ["сводк","отчёт","отчет","итог","обзор","дашборд","dashboard","статус"]
+    if not any(k in text for k in kw):
+        return None
+
+    bal = calc_balances(db)
+    total_money = sum(bal.values())
+    stock = calc_stock(db)
+    stock_items = sum(1 for nid in stock if sum(stock[nid].values()) > 0)
+    debts = calc_debts(db)
+    owe_us = sum(v for v in debts.values() if v > 0)
+    we_owe = sum(-v for v in debts.values() if v < 0)
+    contractors = db.get("trade",{}).get("contractors",[])
+    employees = db.get("trade",{}).get("employees",[])
+    noms = db.get("trade",{}).get("nomenclature",[])
+
+    lines = [f"{'='*28}", _bold("СВОДКА"), f"{'='*28}\n"]
+    lines.append(f"💰 {_bold('Финансы')}")
+    for acc_id, amount in bal.items():
+        lines.append(f"  {_esc(get_account_name(db, acc_id))}: {_bold(fmt(amount) + ' сом')}")
+    lines.append(f"  {'─'*20}")
+    lines.append(f"  Итого: {_bold(fmt(total_money) + ' сом')}\n")
+
+    lines.append(f"📦 {_bold('Склад')}: {_esc(str(stock_items))} позиций с остатками")
+    lines.append(f"📋 {_bold('Номенклатура')}: {_esc(str(len(noms)))} позиций")
+    lines.append(f"🤝 {_bold('Контрагенты')}: {_esc(str(len(contractors)))}")
+    lines.append(f"👥 {_bold('Сотрудники')}: {_esc(str(len(employees)))}\n")
+
+    if owe_us or we_owe:
+        lines.append(f"📊 {_bold('Взаиморасчёты')}")
+        if owe_us:
+            lines.append(f"  Нам должны: {_bold(fmt(owe_us) + ' сом')}")
+        if we_owe:
+            lines.append(f"  Мы должны: {_bold(fmt(we_owe) + ' сом')}")
+
+    return "\n".join(lines)
+
 
 def handle_money(db, text):
-    """Сколько денег на счетах / в кассе"""
-    keywords = ["деньг", "денег", "денежн", "баланс", "счёт", "счет", "касс", "финанс", "бюджет"]
+    kw = ["деньг","денег","денежн","баланс","счёт","счет","касс","финанс","бюджет"]
     if "взаиморасч" in text:
-        return None  # это про долги, не про деньги
-    if not any(kw in text for kw in keywords):
         return None
-    balances = calc_balances(db)
-    if not balances:
-        return "Нет данных по движению денег."
-    lines = ["Остатки по счетам:"]
-    total = 0
-    for acc_id, amount in balances.items():
-        lines.append(f"  {get_account_name(db, acc_id)}: {fmt(amount)} сом")
-        total += amount
-    lines.append(f"\nИтого: {fmt(total)} сом")
+    if not any(k in text for k in kw):
+        return None
+    bal = calc_balances(db)
+    if not bal:
+        return _bold("Нет данных по движению денег\\.")
+
+    lines = [f"💰 {_bold('Остатки по счетам')}\n"]
+    bank_total, cash_total = 0, 0
+    banks, cashes = [], []
+    for acc_id, amount in bal.items():
+        name = get_account_name(db, acc_id)
+        entry = f"  {_esc(name)}: {_bold(fmt(amount) + ' сом')}"
+        if acc_id.startswith("bank:"):
+            banks.append(entry)
+            bank_total += amount
+        else:
+            cashes.append(entry)
+            cash_total += amount
+    if banks:
+        lines.append(f"🏦 {_esc('Банковские счета')}:")
+        lines.extend(banks)
+        lines.append("")
+    if cashes:
+        lines.append(f"💵 {_esc('Кассы')}:")
+        lines.extend(cashes)
+        lines.append("")
+    lines.append(f"{'─'*24}")
+    lines.append(f"Итого: {_bold(fmt(bank_total + cash_total) + ' сом')}")
     return "\n".join(lines)
 
 
 def handle_debts(db, text):
-    """Сколько должны контрагенты / кому мы должны"""
-    kw_owe_us = ["должн", "должен", "долг", "долж", "дебитор", "задолжен", "задолженн", "взаиморасчёт", "взаиморасчет"]
-    kw_we_owe = ["мы должн", "мы должен", "наш долг", "кредитор", "наша задолженн", "кому мы должн", "кому должны мы"]
-    if not any(kw in text for kw in kw_owe_us):
+    kw_all = ["должн","должен","долг","долж","дебитор","задолжен","задолженн","взаиморасчёт","взаиморасчет"]
+    kw_we = ["мы должн","мы должен","наш долг","кредитор","наша задолженн","кому мы должн","кому должны мы"]
+    if not any(k in text for k in kw_all):
         return None
 
-    debts = calc_contractor_debts(db)
-    we_ask_our_debt = any(kw in text for kw in kw_we_owe)
-
+    debts = calc_debts(db)
     if not debts:
-        return "Нет данных по взаиморасчётам с контрагентами.\nДолги появятся после оформления реализаций/поступлений и оплат."
+        return f"📊 {_bold('Взаиморасчёты')}\n\nДанных нет\\. Долги появятся после оформления документов\\."
 
-    # Ищем конкретного контрагента в вопросе
-    search = clean_search(text, ["должн", "долг", "дебитор", "кредитор", "задолженн",
-                                  "контрагент", "поставщик", "покупател", "клиент", "нам", "мы"])
+    search = clean_search(text, ["должн","долг","дебитор","кредитор","задолженн","контрагент","поставщик","покупател","клиент","нам","мы"])
     if search:
         found = find_contractor(db, search)
         if found:
-            lines = []
+            lines = [f"📊 {_bold('Взаиморасчёты')}\n"]
             for c in found:
                 d = debts.get(c["id"], 0)
                 if d > 0:
-                    lines.append(f"{c['name']}: должен нам {fmt(d)} сом")
+                    lines.append(f"🔴 {_esc(c['name'])}: должен нам {_bold(fmt(d) + ' сом')}")
                 elif d < 0:
-                    lines.append(f"{c['name']}: мы должны {fmt(-d)} сом")
+                    lines.append(f"🟡 {_esc(c['name'])}: мы должны {_bold(fmt(-d) + ' сом')}")
                 else:
-                    lines.append(f"{c['name']}: взаиморасчёты закрыты (0 сом)")
+                    lines.append(f"🟢 {_esc(c['name'])}: расчёты закрыты")
             return "\n".join(lines)
 
-    # Общая сводка
-    owe_us = {}  # нам должны
-    we_owe = {}  # мы должны
+    owe_us, we_owe = {}, {}
     for c_id, amount in debts.items():
-        if amount > 0:
-            owe_us[c_id] = amount
-        elif amount < 0:
-            we_owe[c_id] = -amount
+        if amount > 0:   owe_us[c_id] = amount
+        elif amount < 0:  we_owe[c_id] = -amount
 
-    lines = []
-    if not we_ask_our_debt and owe_us:
-        lines.append("Нам должны:")
-        for c_id, amount in owe_us.items():
-            lines.append(f"  {get_contractor_name(db, c_id)}: {fmt(amount)} сом")
-        lines.append(f"  Итого: {fmt(sum(owe_us.values()))} сом\n")
+    we_ask_ours = any(k in text for k in kw_we)
+    lines = [f"📊 {_bold('Взаиморасчёты')}\n"]
+
+    if not we_ask_ours and owe_us:
+        lines.append(f"🔴 {_esc('Нам должны')}:")
+        for c_id, amt in sorted(owe_us.items(), key=lambda x: -x[1]):
+            lines.append(f"  {_esc(get_contractor_name(db, c_id))}: {_bold(fmt(amt) + ' сом')}")
+        lines.append(f"  Итого: {_bold(fmt(sum(owe_us.values())) + ' сом')}\n")
     if we_owe:
-        lines.append("Мы должны:")
-        for c_id, amount in we_owe.items():
-            lines.append(f"  {get_contractor_name(db, c_id)}: {fmt(amount)} сом")
-        lines.append(f"  Итого: {fmt(sum(we_owe.values()))} сом")
-    if not we_ask_our_debt and not owe_us and not we_owe:
-        return "Все взаиморасчёты закрыты, долгов нет."
-    if not lines:
-        return "По данному направлению долгов нет."
+        lines.append(f"🟡 {_esc('Мы должны')}:")
+        for c_id, amt in sorted(we_owe.items(), key=lambda x: -x[1]):
+            lines.append(f"  {_esc(get_contractor_name(db, c_id))}: {_bold(fmt(amt) + ' сом')}")
+        lines.append(f"  Итого: {_bold(fmt(sum(we_owe.values())) + ' сом')}")
+
+    if not owe_us and not we_owe:
+        lines.append("🟢 Все расчёты закрыты, долгов нет\\.")
     return "\n".join(lines)
 
 
 def handle_price(db, text):
-    """Сколько стоит товар / цена товара"""
-    keywords = ["стоит", "стоимость", "цен", "прайс", "расценк"]
-    if not any(kw in text for kw in keywords):
+    kw = ["стоит","стоимость","цен","прайс","расценк"]
+    if not any(k in text for k in kw):
         return None
-    search = clean_search(text, ["стоит", "стоимость", "цена", "прайс", "расценка", "товар"])
-    if not search:
-        # Показываем прайс-лист
-        noms = db.get("trade", {}).get("nomenclature", [])
-        lines = [f"Прайс-лист ({len(noms)} позиций):"]
-        for n in noms:
-            if n.get("price", 0) > 0:
-                lines.append(f"  {n['name']}: {fmt(n['price'])} сом/{n.get('unit', 'шт')}")
-        return "\n".join(lines)
-    noms = find_nomenclature(db, search)
-    if not noms:
-        return f"Товар '{search}' не найден."
-    lines = []
+    search = clean_search(text, ["стоит","стоимость","цена","прайс","расценка","товар"])
+    noms = db.get("trade",{}).get("nomenclature",[])
+    if search:
+        noms = find_nomenclature(db, search)
+        if not noms:
+            return f"Товар '{_esc(search)}' не найден\\."
+
+    lines = [f"🏷 {_bold('Прайс-лист')}\n"]
     for n in noms:
-        price = n.get("price", 0)
-        cost = n.get("cost", 0)
-        line = f"{n['name']}: {fmt(price)} сом/{n.get('unit', 'шт')}"
-        if cost > 0:
-            line += f" (себестоимость: {fmt(cost)} сом)"
-        lines.append(line)
+        p = n.get("price", 0)
+        c = n.get("cost", 0)
+        if p > 0 or search:
+            line = f"  {_esc(n['name'])}: {_bold(fmt(p) + ' сом')}/{_esc(n.get('unit','шт'))}"
+            if c > 0 and search:
+                line += f" \\(себест\\. {_esc(fmt(c))} сом\\)"
+            lines.append(line)
     return "\n".join(lines)
 
 
 def handle_warehouses(db, text):
-    """Список складов"""
     if not re.search(r'\bсклад[ыа]?\b', text):
         return None
-    if any(kw in text for kw in ["сколько", "остат", "наличи", "есть", "что на"]):
-        return None  # это вопрос про остатки, не про список складов
-    warehouses = db.get("trade", {}).get("warehouses", [])
-    if not warehouses:
-        return "Склады не найдены."
-    lines = ["Склады:"]
-    for w in warehouses:
-        lines.append(f"  {w['name']} ({w.get('kind', '')}), ответственный: {w.get('responsible', '-')}")
+    if any(k in text for k in ["сколько","остат","наличи","есть","что на"]):
+        return None
+    whs = db.get("trade",{}).get("warehouses",[])
+    if not whs:
+        return "Склады не найдены\\."
+    lines = [f"🏭 {_bold('Склады')}\n"]
+    for w in whs:
+        lines.append(f"  📍 {_bold(w['name'])}")
+        lines.append(f"     Тип: {_esc(w.get('kind',''))}")
+        lines.append(f"     Ответственный: {_esc(w.get('responsible','-'))}")
     return "\n".join(lines)
 
 
 def handle_stock(db, text):
-    """Остатки на складе"""
-    keywords = ["склад", "остат", "наличи", "сколько", "есть ли", "имеется"]
-    if not any(kw in text for kw in keywords):
+    kw = ["склад","остат","наличи","сколько","есть ли","имеется"]
+    if not any(k in text for k in kw):
         return None
     search = clean_search(text, [
-        "склад", "складе", "складу", "складах", "остатки", "остаток", "остатков",
-        "наличие", "наличии", "имеется", "имеются", "товар", "штук", "штуки", "кг", "шт",
+        "склад","складе","складу","складах","остатки","остаток","остатков",
+        "наличие","наличии","имеется","имеются","товар","штук","штуки","кг","шт",
     ])
 
+    noms = db.get("trade",{}).get("nomenclature",[])
     if search:
-        noms = find_nomenclature(db, search)
-        if not noms:
-            all_noms = db.get("trade", {}).get("nomenclature", [])
-            suggestions = [n["name"] for n in all_noms
-                           if any(w in n["name"].lower() for w in search.split() if len(w) > 2)]
+        found = find_nomenclature(db, search)
+        if not found:
+            suggestions = [n["name"] for n in noms if any(w in n["name"].lower() for w in search.split() if len(w)>2)]
             if suggestions:
-                return f"Товар '{search}' не найден. Может вы имели в виду:\n" + "\n".join(f"  - {s}" for s in suggestions[:10])
-            return f"Товар '{search}' не найден в номенклатуре."
-    else:
-        noms = db.get("trade", {}).get("nomenclature", [])
+                return f"Товар '{_esc(search)}' не найден\\. Может имелось в виду:\n" + "\n".join(f"  • {_esc(s)}" for s in suggestions[:10])
+            return f"Товар '{_esc(search)}' не найден\\."
+        noms = found
 
     stock = calc_stock(db)
     has_any = any(stock.get(n["id"]) for n in noms)
 
     if not has_any:
-        lines = ["На складе пока нет движений (приход/расход не оформлялся).\n"]
-        show = [n for n in noms if n.get("kind") in ("Товар", "Материал", "Продукция", "Тара")]
-        lines.append(f"Номенклатура ({len(show)} позиций):")
-        for n in show:
-            lines.append(f"  {n['name']} [{n.get('kind','')}] — 0 {n.get('unit', 'шт')}")
-        lines.append("\nОформите поступление товара на сайте, тогда появятся остатки.")
+        lines = [f"📦 {_bold('Остатки на складе')}\n"]
+        show = [n for n in noms if n.get("kind") in ("Товар","Материал","Продукция","Тара")]
+        if show:
+            for n in show:
+                lines.append(f"  {_esc(n['name'])}: {_bold('0')} {_esc(n.get('unit','шт'))}")
+            lines.append(f"\n⚠️ {_esc('Движений пока нет. Оформите поступление товара на сайте.')}")
         return "\n".join(lines)
 
-    lines = ["Остатки на складе:"]
+    lines = [f"📦 {_bold('Остатки на складе')}\n"]
     for n in noms:
         ns = stock.get(n["id"], {})
         total = sum(ns.values())
-        if total != 0:
-            lines.append(f"  {n['name']}: {fmt(total)} {n.get('unit', 'шт')}")
-            for wh_id, qty in ns.items():
-                lines.append(f"      {get_warehouse_name(db, wh_id)}: {fmt(qty)} {n.get('unit', 'шт')}")
+        if total > 0:
+            lines.append(f"  ✅ {_esc(n['name'])}: {_bold(fmt(total))} {_esc(n.get('unit','шт'))}")
+            if len(ns) > 1:
+                for wh_id, qty in ns.items():
+                    lines.append(f"       {_esc(get_warehouse_name(db, wh_id))}: {_esc(fmt(qty))}")
+        elif total < 0:
+            lines.append(f"  ⚠️ {_esc(n['name'])}: {_bold(fmt(total))} {_esc(n.get('unit','шт'))} \\(минус\\!\\)")
         elif search:
-            lines.append(f"  {n['name']}: 0 {n.get('unit', 'шт')} (нет движений)")
+            lines.append(f"  ◻️ {_esc(n['name'])}: {_bold('0')} {_esc(n.get('unit','шт'))}")
     return "\n".join(lines)
 
 
 def handle_goods(db, text):
-    """Список товаров / номенклатура"""
-    keywords = ["товар", "номенклатур", "ассортимент", "что продаём", "что продаем", "каталог"]
-    if not any(kw in text for kw in keywords):
+    kw = ["товар","номенклатур","ассортимент","что продаём","что продаем","каталог"]
+    if not any(k in text for k in kw):
         return None
-    noms = db.get("trade", {}).get("nomenclature", [])
+    noms = db.get("trade",{}).get("nomenclature",[])
     if not noms:
-        return "Номенклатура пуста."
-    lines = [f"Номенклатура ({len(noms)} позиций):"]
+        return "Номенклатура пуста\\."
+
+    lines = [f"📋 {_bold('Номенклатура')} \\({_esc(str(len(noms)))} позиций\\)\n"]
+    by_kind = {}
     for n in noms:
-        price = fmt(n.get("price", 0))
-        lines.append(f"  {n['name']} [{n.get('kind', '')}] - {price} сом/{n.get('unit', 'шт')}")
+        by_kind.setdefault(n.get("kind","Прочее"), []).append(n)
+    for kind, items in by_kind.items():
+        lines.append(f"  {_bold(kind)}:")
+        for n in items:
+            p = fmt(n.get("price",0))
+            lines.append(f"    {_esc(n['name'])} — {_bold(p + ' сом')}/{_esc(n.get('unit','шт'))}")
+        lines.append("")
     return "\n".join(lines)
 
 
 def handle_contractors(db, text):
-    """Контрагенты"""
-    keywords = ["контрагент", "поставщик", "покупател", "клиент", "партнёр", "партнер"]
-    if not any(kw in text for kw in keywords):
+    kw = ["контрагент","поставщик","покупател","клиент","партнёр","партнер"]
+    if not any(k in text for k in kw):
         return None
-    search = clean_search(text, keywords + ["список", "информац", "данные", "инн"])
-    contractors = db.get("trade", {}).get("contractors", [])
+    search = clean_search(text, kw + ["список","информац","данные","инн"])
+    contractors = db.get("trade",{}).get("contractors",[])
     if search:
         contractors = find_contractor(db, search)
     if not contractors:
-        return "Контрагенты не найдены."
+        return "Контрагенты не найдены\\."
 
-    # Если нашли конкретного — подробная инфо
     if len(contractors) <= 3 and search:
         lines = []
         for c in contractors:
-            lines.append(f"{c.get('name', '')}")
-            if c.get("full"): lines.append(f"  Полное: {c['full']}")
-            if c.get("inn"): lines.append(f"  ИНН: {c['inn']}")
-            if c.get("kind"): lines.append(f"  Тип: {c['kind']}")
-            if c.get("address"): lines.append(f"  Адрес: {c['address']}")
-            if c.get("phone"): lines.append(f"  Тел: {c['phone']}")
-            if c.get("email"): lines.append(f"  Email: {c['email']}")
-            # Показать договоры
-            contracts = [d for d in db.get("trade", {}).get("contracts", []) if d.get("contractor") == c["id"]]
+            lines.append(f"🤝 {_bold(c.get('name',''))}\n")
+            if c.get("full"):    lines.append(_line("Полное название", c["full"]))
+            if c.get("inn"):     lines.append(_line("ИНН", c["inn"]))
+            if c.get("kind"):    lines.append(_line("Тип", c["kind"]))
+            if c.get("address"): lines.append(_line("Адрес", c["address"]))
+            if c.get("phone"):   lines.append(_line("Телефон", c["phone"]))
+            contracts = [d for d in db.get("trade",{}).get("contracts",[]) if d.get("contractor")==c["id"]]
             if contracts:
-                lines.append("  Договоры:")
+                lines.append(f"\n  📝 {_esc('Договоры')}:")
                 for d in contracts:
-                    lines.append(f"    №{d.get('number', '?')} от {d.get('date', '?')} - {d.get('name', '')} ({d.get('kind', '')})")
+                    lines.append(f"    №{_esc(d.get('number','?'))} от {_esc(d.get('date','?'))} — {_esc(d.get('name',''))}")
         return "\n".join(lines)
 
-    # Список
-    lines = [f"Контрагенты ({len(contractors)}):"]
+    lines = [f"🤝 {_bold('Контрагенты')} \\({_esc(str(len(contractors)))}\\)\n"]
     for c in contractors:
-        lines.append(f"  {c['name']} (ИНН: {c.get('inn', '-')})")
+        lines.append(f"  • {_esc(c['name'])}  \\|  ИНН: {_esc(c.get('inn','-'))}")
     return "\n".join(lines)
 
 
 def handle_employees(db, text):
-    """Сотрудники"""
-    keywords = ["сотрудник", "работник", "персонал", "кадр", "штат", "табельн"]
-    # Также ловим "инфо о [имя]" — проверяем совпадение с именами сотрудников
-    direct_match = False
-    if not any(kw in text for kw in keywords):
-        # Проверяем, не спрашивают ли про конкретного сотрудника по имени/фамилии
-        employees = db.get("trade", {}).get("employees", [])
-        search = clean_search(text, ["информация", "инфо", "данные", "расскажи", "про", "кто", "такой", "такая"])
-        if search and any(fuzzy_match(search, e.get("name", "")) for e in employees):
-            direct_match = True
-        else:
+    kw = ["сотрудник","работник","персонал","кадр","штат","табельн"]
+    if not any(k in text for k in kw):
+        employees = db.get("trade",{}).get("employees",[])
+        search = clean_search(text, ["информация","инфо","данные","расскажи","про","кто","такой","такая"])
+        if not (search and any(fuzzy_match(search, e.get("name","")) for e in employees)):
             return None
-    search = clean_search(text, keywords + ["список", "информац", "данные"])
-    employees = db.get("trade", {}).get("employees", [])
 
+    search = clean_search(text, kw + ["список","информац","данные"])
+    employees = db.get("trade",{}).get("employees",[])
     if search:
         found = find_employee(db, search)
         if found:
             employees = found
-        # Если не нашли — показываем всех
 
     if not employees:
-        return "Список сотрудников пуст."
+        return "Список сотрудников пуст\\."
 
-    # Если нашли конкретного — подробно
     if len(employees) <= 2 and search:
         lines = []
         for e in employees:
-            lines.append(f"{e.get('name', '')}")
-            lines.append(f"  Таб. №: {e.get('tabNo', '-')}")
-            lines.append(f"  Должность: {get_position_name(db, e.get('position', ''))}")
-            if e.get("phone"): lines.append(f"  Тел: {e['phone']}")
-            if e.get("birth"): lines.append(f"  Дата рождения: {e['birth']}")
-            if e.get("inn"): lines.append(f"  ИНН: {e['inn']}")
-            if e.get("address"): lines.append(f"  Адрес: {e['address']}")
+            lines.append(f"👤 {_bold(e.get('name',''))}\n")
+            lines.append(_line("Таб. №", e.get("tabNo","-")))
+            lines.append(_line("Должность", get_position_name(db, e.get("position",""))))
+            if e.get("phone"):    lines.append(_line("Телефон", e["phone"]))
+            if e.get("birth"):    lines.append(_line("Дата рождения", e["birth"]))
+            if e.get("inn"):      lines.append(_line("ИНН", e["inn"]))
+            if e.get("address"):  lines.append(_line("Адрес", e["address"]))
             salary = e.get("salary", 0)
-            if salary: lines.append(f"  Оклад: {fmt(salary)} сом")
+            if salary:            lines.append(_line("Оклад", f"{fmt(salary)} сом"))
+            if e.get("status"):   lines.append(_line("Статус", e["status"]))
         return "\n".join(lines)
 
-    # Общий список
-    lines = [f"Сотрудники ({len(employees)}):"]
+    lines = [f"👥 {_bold('Сотрудники')} \\({_esc(str(len(employees)))}\\)\n"]
     for e in employees:
-        pos = get_position_name(db, e.get("position", ""))
-        lines.append(f"  {e['name']} - {pos}")
+        pos = get_position_name(db, e.get("position",""))
+        lines.append(f"  • {_esc(e['name'])} — {_esc(pos)}")
     return "\n".join(lines)
 
 
 def handle_org(db, text):
-    """Информация об организации"""
-    keywords = ["организац", "компани", "фирм", "реквизит", "наша компан", "юрлиц"]
-    if not any(kw in text for kw in keywords):
+    kw = ["организац","компани","фирм","реквизит","наша компан","юрлиц"]
+    if not any(k in text for k in kw):
         return None
-    org = db.get("trade", {}).get("org", {})
+    org = db.get("trade",{}).get("org",{})
     if not org or not org.get("name"):
-        return "Данные организации не заполнены."
-    lines = ["Организация:"]
-    if org.get("name"): lines.append(f"  Название: {org['name']}")
-    if org.get("inn"): lines.append(f"  ИНН: {org['inn']}")
-    if org.get("address"): lines.append(f"  Адрес: {org['address']}")
-    if org.get("phone"): lines.append(f"  Тел: {org['phone']}")
-    if org.get("director"): lines.append(f"  Руководитель: {org['director']}")
-    if org.get("accountant"): lines.append(f"  Бухгалтер: {org['accountant']}")
-    if org.get("okpo"): lines.append(f"  ОКПО: {org['okpo']}")
+        return "Данные организации не заполнены\\."
+    lines = [f"🏢 {_bold('Организация')}\n"]
+    if org.get("name"):       lines.append(_line("Название", org["name"]))
+    if org.get("inn"):        lines.append(_line("ИНН", org["inn"]))
+    if org.get("address"):    lines.append(_line("Адрес", org["address"]))
+    if org.get("phone"):      lines.append(_line("Телефон", org["phone"]))
+    if org.get("director"):   lines.append(_line("Руководитель", org["director"]))
+    if org.get("accountant"): lines.append(_line("Бухгалтер", org["accountant"]))
     return "\n".join(lines)
 
 
-def handle_payroll_info(db, text):
-    """Зарплатные ставки и налоги"""
-    keywords = ["зарплат", "оклад", "налог", "отчислен", "ставк", "соцфонд", "подоходн"]
-    if not any(kw in text for kw in keywords):
+def handle_payroll(db, text):
+    kw = ["зарплат","оклад","налог","отчислен","ставк","соцфонд","подоходн"]
+    if not any(k in text for k in kw):
         return None
-    payroll = db.get("trade", {}).get("payroll", {})
-    if not payroll:
-        return "Зарплатные настройки не заданы."
-    lines = ["Зарплатные настройки:"]
-    lines.append(f"  Подоходный налог: {payroll.get('incomeTax', 0)}%")
-    lines.append(f"  Соцфонд (сотрудник): {payroll.get('sfEmployee', 0)}%")
-    lines.append(f"    в т.ч. ПФ: {payroll.get('sfEmployeePF', 0)}%, ГНПФ: {payroll.get('sfEmployeeGNPF', 0)}%")
-    lines.append(f"  Соцфонд (работодатель): {payroll.get('sfEmployer', 0)}%")
-    lines.append(f"    в т.ч. ПФ: {payroll.get('sfEmployerPF', 0)}%, ФОМС: {payroll.get('sfEmployerFOMS', 0)}%, ФОТ: {payroll.get('sfEmployerFOT', 0)}%")
-    lines.append(f"  Стандартный вычет: {fmt(payroll.get('stdDeduction', 0))} сом")
-    lines.append(f"  Вычет на иждивенца: {fmt(payroll.get('dependentDeduction', 0))} сом")
-    lines.append(f"  Мин. зарплата: {fmt(payroll.get('minSalary', 0))} сом")
+    pr = db.get("trade",{}).get("payroll",{})
+    if not pr:
+        return "Зарплатные настройки не заданы\\."
+    lines = [f"💼 {_bold('Зарплатные настройки')}\n"]
+    lines.append(f"  Подоходный налог: {_bold(str(pr.get('incomeTax',0)) + '%')}")
+    lines.append(f"  Соцфонд \\(сотрудник\\): {_bold(str(pr.get('sfEmployee',0)) + '%')}")
+    lines.append(f"  Соцфонд \\(работодатель\\): {_bold(str(pr.get('sfEmployer',0)) + '%')}")
+    lines.append(f"  Стандартный вычет: {_bold(fmt(pr.get('stdDeduction',0)) + ' сом')}")
+    lines.append(f"  Мин\\. зарплата: {_bold(fmt(pr.get('minSalary',0)) + ' сом')}")
     return "\n".join(lines)
 
 
 def handle_contracts(db, text):
-    """Договоры"""
-    keywords = ["договор", "контракт"]
-    if not any(kw in text for kw in keywords):
+    kw = ["договор","контракт"]
+    if not any(k in text for k in kw):
         return None
-    contracts = db.get("trade", {}).get("contracts", [])
+    contracts = db.get("trade",{}).get("contracts",[])
     if not contracts:
-        return "Договоры не найдены."
-    lines = [f"Договоры ({len(contracts)}):"]
+        return "Договоры не найдены\\."
+    lines = [f"📝 {_bold('Договоры')} \\({_esc(str(len(contracts)))}\\)\n"]
     for d in contracts:
-        c_name = get_contractor_name(db, d.get("contractor", ""))
-        lines.append(f"  №{d.get('number', '?')} от {d.get('date', '?')} - {d.get('name', '')}")
-        lines.append(f"    Контрагент: {c_name}, тип: {d.get('kind', '')}")
+        c_name = get_contractor_name(db, d.get("contractor",""))
+        lines.append(f"  №{_esc(d.get('number','?'))} от {_esc(d.get('date','?'))}")
+        lines.append(f"    {_esc(d.get('name',''))} \\| {_esc(c_name)}")
+        lines.append("")
     return "\n".join(lines)
 
 
-def handle_summary(db, text):
-    """Общая сводка / отчёт"""
-    keywords = ["сводк", "отчёт", "отчет", "итог", "обзор", "дашборд", "dashboard", "статус"]
-    if not any(kw in text for kw in keywords):
-        return None
-    lines = ["Сводка по базе:\n"]
-
-    # Деньги
-    balances = calc_balances(db)
-    total_money = sum(balances.values()) if balances else 0
-    lines.append(f"Деньги: {fmt(total_money)} сом")
-    for acc_id, amount in balances.items():
-        lines.append(f"  {get_account_name(db, acc_id)}: {fmt(amount)} сом")
-
-    # Склад
-    stock = calc_stock(db)
-    stock_count = sum(1 for nid in stock if sum(stock[nid].values()) > 0)
-    lines.append(f"\nТовары на складе: {stock_count} позиций с остатками")
-
-    # Контрагенты
-    contractors = db.get("trade", {}).get("contractors", [])
-    lines.append(f"Контрагентов: {len(contractors)}")
-
-    # Долги
-    debts = calc_contractor_debts(db)
-    owe_us = sum(v for v in debts.values() if v > 0)
-    we_owe = sum(-v for v in debts.values() if v < 0)
-    if owe_us: lines.append(f"Нам должны: {fmt(owe_us)} сом")
-    if we_owe: lines.append(f"Мы должны: {fmt(we_owe)} сом")
-
-    # Сотрудники
-    employees = db.get("trade", {}).get("employees", [])
-    lines.append(f"Сотрудников: {len(employees)}")
-
-    # Номенклатура
-    noms = db.get("trade", {}).get("nomenclature", [])
-    lines.append(f"Номенклатура: {len(noms)} позиций")
-
-    return "\n".join(lines)
-
-
-# =============================================
-# Главная маршрутизация
-# =============================================
+# ══════════════════════════════════════════════
+#  Маршрутизация
+# ══════════════════════════════════════════════
 
 HANDLERS = [
-    handle_summary,      # "сводка", "отчёт" — первый, чтобы не перехватывался
-    handle_money,        # "деньги", "счёт", "баланс"
-    handle_debts,        # "должны", "долг"
-    handle_price,        # "стоит", "цена"
-    handle_payroll_info, # "зарплата", "налог"
-    handle_org,          # "организация", "реквизиты"
-    handle_contracts,    # "договор"
-    handle_warehouses,   # "склады" (без вопроса про остатки)
-    handle_stock,        # "сколько", "склад", "остатки"
-    handle_goods,        # "товары", "номенклатура"
-    handle_contractors,  # "контрагенты", "поставщики"
-    handle_employees,    # "сотрудники", "кадры"
+    handle_summary, handle_money, handle_debts, handle_price,
+    handle_payroll, handle_org, handle_contracts, handle_warehouses,
+    handle_stock, handle_goods, handle_contractors, handle_employees,
 ]
-
-HELP_TEXT = (
-    "Я могу ответить на:\n\n"
-    "  Сколько [товар] на складе?\n"
-    "  Сколько денег на счетах?\n"
-    "  Сколько стоит [товар]?\n"
-    "  Кто нам должен? / Наши долги\n"
-    "  Сводка / Отчёт\n"
-    "  Список товаров\n"
-    "  Контрагенты / инфо о [контрагент]\n"
-    "  Сотрудники / инфо о [сотрудник]\n"
-    "  Договоры\n"
-    "  Реквизиты организации\n"
-    "  Зарплатные ставки\n"
-    "  Склады\n\n"
-    "Просто напишите вопрос!"
-)
 
 
 def process_question(text: str) -> str:
@@ -663,53 +611,144 @@ def process_question(text: str) -> str:
         db = fetch_db()
     except Exception as e:
         log.error(f"Ошибка загрузки данных: {e}")
-        return "Не удалось загрузить данные с сервера. Попробуйте позже."
+        return "⚠️ Не удалось загрузить данные\\. Попробуйте позже\\."
 
     for handler in HANDLERS:
         result = handler(db, text_lower)
         if result is not None:
             return result
+    return None
 
-    return "Не совсем понял вопрос.\n\n" + HELP_TEXT
+
+# ══════════════════════════════════════════════
+#  Telegram: кнопки быстрых действий
+# ══════════════════════════════════════════════
+
+MAIN_MENU = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📊 Сводка", callback_data="q:сводка"),
+     InlineKeyboardButton("💰 Деньги", callback_data="q:сколько денег на счетах")],
+    [InlineKeyboardButton("📦 Склад", callback_data="q:остатки на складе"),
+     InlineKeyboardButton("📊 Долги", callback_data="q:кто нам должен")],
+    [InlineKeyboardButton("📋 Товары", callback_data="q:список товаров"),
+     InlineKeyboardButton("🤝 Контрагенты", callback_data="q:контрагенты")],
+    [InlineKeyboardButton("👥 Сотрудники", callback_data="q:сотрудники"),
+     InlineKeyboardButton("🏷 Прайс", callback_data="q:прайс-лист")],
+])
+
+HELP_MD = (
+    f"Я могу ответить на:\n\n"
+    f"  📦 _Сколько \\[товар\\] на складе?_\n"
+    f"  💰 _Сколько денег на счетах?_\n"
+    f"  🏷 _Сколько стоит \\[товар\\]?_\n"
+    f"  📊 _Кто нам должен? / Наши долги_\n"
+    f"  📈 _Сводка / Отчёт_\n"
+    f"  📋 _Список товаров_\n"
+    f"  🤝 _Контрагенты_\n"
+    f"  👥 _Сотрудники_\n"
+    f"  📝 _Договоры_\n"
+    f"  🏢 _Реквизиты организации_\n"
+    f"  💼 _Зарплатные ставки_\n\n"
+    f"Или нажмите кнопку ниже 👇"
+)
 
 
-# =============================================
-# Telegram
-# =============================================
+# ══════════════════════════════════════════════
+#  Telegram: обработчики
+# ══════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я бот бухгалтерии.\n\n" + HELP_TEXT)
+    user = update.effective_user
+    await update.message.reply_text(
+        f"Здравствуйте, {_esc(user.first_name)}\\! 👋\n\n"
+        f"Я — бот бухгалтерии\\. Задайте вопрос или выберите раздел:\n\n"
+        + HELP_MD,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=MAIN_MENU,
+    )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(HELP_MD, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=MAIN_MENU)
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Выберите раздел:", reply_markup=MAIN_MENU)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("q:"):
+        question = data[2:]
+        await query.message.chat.send_action(ChatAction.TYPING)
+        answer = process_question(question)
+        if not answer:
+            answer = "Нет данных по этому запросу\\."
+        if len(answer) > 4000:
+            answer = answer[:4000] + "\n\n\\.\\.\\. \\(обрезано\\)"
+        try:
+            await query.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=MAIN_MENU)
+        except Exception:
+            await query.message.reply_text(answer.replace("\\", ""), reply_markup=MAIN_MENU)
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if not text:
         return
-    log.info(f"Вопрос от {update.effective_user.first_name}: {text}")
+    log.info(f"[{update.effective_user.first_name}] {text}")
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
     answer = process_question(text)
-    # Telegram лимит 4096 символов
+    if not answer:
+        answer = f"🤔 Не совсем понял вопрос\\.\n\n{HELP_MD}"
+
     if len(answer) > 4000:
-        answer = answer[:4000] + "\n\n... (обрезано)"
-    await update.message.reply_text(answer)
-    log.info(f"Ответ: {answer[:100]}...")
+        answer = answer[:4000] + "\n\n\\.\\.\\. \\(обрезано\\)"
+
+    try:
+        await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=MAIN_MENU)
+    except Exception as e:
+        log.warning(f"Markdown error, fallback to plain: {e}")
+        plain = re.sub(r'\\(.)', r'\1', answer)
+        plain = re.sub(r'\*([^*]+)\*', r'\1', plain)
+        await update.message.reply_text(plain, reply_markup=MAIN_MENU)
+
+    log.info(f"[ответ] {answer[:80]}...")
+
+
+# ══════════════════════════════════════════════
+#  Запуск
+# ══════════════════════════════════════════════
+
+async def post_init(app: Application):
+    await app.bot.set_my_commands([
+        BotCommand("start", "Начать работу"),
+        BotCommand("menu", "Главное меню"),
+        BotCommand("help", "Справка"),
+    ])
+    log.info("Команды бота зарегистрированы")
 
 
 def main():
     if not TELEGRAM_TOKEN:
-        log.error("TELEGRAM_TOKEN не задан в .env!")
+        log.error("TELEGRAM_TOKEN не задан!")
         return
     if not GITHUB_REPO:
-        log.error("GITHUB_REPO не задан в .env!")
+        log.error("GITHUB_REPO не задан!")
         return
+
     log.info("Запуск бота...")
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    log.info("Бот запущен! Ожидаю сообщения...")
-    app.run_polling()
+
+    log.info("Бот запущен!")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
