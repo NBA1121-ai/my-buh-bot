@@ -119,14 +119,15 @@ def get_account_name(db, acc_id):
     """acc_id может быть 'bank:_1' или 'cash:_1' или просто '_1'."""
     raw_id = acc_id.split(":", 1)[-1] if ":" in acc_id else acc_id
     prefix = acc_id.split(":", 1)[0] if ":" in acc_id else ""
-    for a in db.get("accounts", []):
-        if a["id"] == raw_id:
-            return a.get("name", raw_id)
-    # Ищем в кассах
+    # Для кассовых документов — ищем сначала в кассах
     if prefix == "cash":
         for c in db.get("cashs", []):
             if c["id"] == raw_id:
                 return c.get("name", raw_id)
+    # Для банковских — в счетах
+    for a in db.get("accounts", []):
+        if a["id"] == raw_id:
+            return a.get("name", raw_id)
     return raw_id or "Без счёта"
 
 def get_warehouse_name(db, wh_id):
