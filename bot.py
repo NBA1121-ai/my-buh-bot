@@ -2501,7 +2501,8 @@ HELP_MD = (
     f"📄 /pdf — PDF\\-отчёт с графиками\n"
     f"💾 /backup — резервная копия данных\n"
     f"🔲 /qr \\<контрагент\\> — QR для оплаты\n"
-    f"/limit \\<название\\> \\<сумма\\> — задать лимит\n\n"
+    f"/limit \\<название\\> \\<сумма\\> — задать лимит\n"
+    f"/stockalert \\<товар\\> \\<мин\\.кол\\-во\\> — уведомление по остаткам\n\n"
     f"Или нажмите кнопку ниже 👇"
 )
 
@@ -2719,6 +2720,75 @@ async def cmd_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"QR error: {e}")
         await update.message.reply_text("⚠️ Ошибка при генерации QR-кода.")
+
+async def cmd_stockalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Уведомление по остаткам: /stockalert <товар> <мин.кол-во>"""
+    args = context.args or []
+    uid = update.effective_user.id
+
+    if not args:
+        # Показать текущие алерты
+        if not _stock_min_alerts:
+            await update.message.reply_text(
+                "📦 *Уведомления по остаткам*\n\n"
+                "Нет настроенных уведомлений\\.\n\n"
+                "Использование:\n"
+                "`/stockalert мышка 5` — уведомить когда мышек ≤ 5\n"
+                "`/stockalert удалить мышка` — удалить уведомление",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+        lines = ["📦 *Уведомления по остаткам:*\n"]
+        for key, cfg in _stock_min_alerts.items():
+            lines.append(f"  • {_esc(key)}: мин\\. {_esc(fmt(cfg['min']))}")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    # Удаление
+    if args[0].lower() in ("удалить", "удали", "delete", "remove"):
+        name = " ".join(args[1:]).lower().strip()
+        if name in _stock_min_alerts:
+            del _stock_min_alerts[name]
+            await update.message.reply_text(f"✅ Уведомление для «{name}» удалено.")
+        else:
+            await update.message.reply_text(f"❌ Уведомление для «{name}» не найдено.")
+        return
+
+    # Парсим: последний аргумент — число, остальное — название товара
+    try:
+        min_qty = float(args[-1])
+        goods_name = " ".join(args[:-1]).strip()
+    except ValueError:
+        await update.message.reply_text("❌ Последний аргумент должен быть числом.\nПример: /stockalert мышка 5")
+        return
+
+    if not goods_name:
+        await update.message.reply_text("❌ Укажите название товара.\nПример: /stockalert мышка 5")
+        return
+
+    # Проверить что товар существует
+    try:
+        db = fetch_db()
+        found = _find_goods_by_name(db, goods_name)
+        if found:
+            _, real_name = found
+            goods_name = real_name.lower()
+        else:
+            await update.message.reply_text(f"⚠️ Товар «{goods_name}» не найден в базе, но уведомление создано.")
+    except Exception:
+        pass
+
+    _stock_min_alerts[goods_name.lower()] = {
+        "min": min_qty,
+        "chat_id": update.effective_chat.id,
+        "user_id": uid,
+    }
+    await update.message.reply_text(
+        f"✅ Уведомление создано: *{_esc(goods_name)}* — мин\\. остаток *{_esc(fmt(min_qty))}*\n\n"
+        f"Вы получите уведомление когда остаток станет ≤ {_esc(fmt(min_qty))}",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    audit_record(uid, update.effective_user.first_name, "stockalert", f"{goods_name} min={min_qty}")
 
 
 async def _send_chart(chat, chart_bytes: bytes | None, caption: str, no_data_msg: str):
@@ -3142,6 +3212,60 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════
+#  10. Уведомления по остаткам товаров
+# ══════════════════════════════════════════════
+
+# {goods_name_lower: {"min": float, "chat_id": int, "user_id": int}}
+_stock_min_alerts: dict[str, dict] = {}
+_last_stock_alert_time: dict[str, float] = {}  # чтобы не спамить
+
+def _find_goods_by_name(db: dict, search: str) -> tuple[str, str] | None:
+    """Ищет товар по имени, возвращает (id, name) или None."""
+    search_lower = search.lower().strip()
+    for g in db.get("nomenclature", []):
+        if g.get("name", "").lower() == search_lower:
+            return g["id"], g["name"]
+    # Нечёткий
+    for g in db.get("nomenclature", []):
+        if fuzzy_match(search_lower, g.get("name", "")):
+            return g["id"], g["name"]
+    return None
+
+def _check_stock_alerts(db: dict) -> list[str]:
+    """Проверяет минимальные остатки товаров."""
+    if not _stock_min_alerts:
+        return []
+    stock_raw = calc_stock(db)
+    stock_total = {gid: sum(wh.values()) for gid, wh in stock_raw.items()}
+    # Маппинг id → name
+    nom_map = {g["id"]: g.get("name", g["id"]) for g in db.get("nomenclature", [])}
+    now = time.time()
+    alerts = []
+    for key, cfg in _stock_min_alerts.items():
+        min_qty = cfg["min"]
+        # Найти товар
+        found_id = None
+        for gid, name in nom_map.items():
+            if name.lower() == key:
+                found_id = gid
+                break
+        if not found_id:
+            for gid, name in nom_map.items():
+                if fuzzy_match(key, name):
+                    found_id = gid
+                    break
+        actual = stock_total.get(found_id, 0) if found_id else 0
+        name = nom_map.get(found_id, key)
+        if actual <= min_qty:
+            # Не спамить — раз в час
+            last = _last_stock_alert_time.get(key, 0)
+            if now - last > 3600:
+                alerts.append(f"📦 {name}: осталось {fmt(actual)} (мин: {fmt(min_qty)})")
+                _last_stock_alert_time[key] = now
+    return alerts
+
+
+# ══════════════════════════════════════════════
 #  Уведомления
 # ══════════════════════════════════════════════
 
@@ -3203,7 +3327,27 @@ async def check_notifications(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-    # 4. Авто-бэкап (раз в сутки)
+    # 4. Уведомления по минимальным остаткам товаров
+    stock_alerts = _check_stock_alerts(db)
+    if stock_alerts:
+        msg = "📦 *Низкий остаток товаров:*\n\n" + "\n".join(stock_alerts)
+        for chat_id in _notify_chat_ids:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=msg)
+            except Exception:
+                pass
+        # Также уведомляем пользователей, которые настроили алерты
+        notified = set()
+        for key, cfg in _stock_min_alerts.items():
+            cid = cfg.get("chat_id")
+            if cid and cid not in _notify_chat_ids and cid not in notified:
+                try:
+                    await context.bot.send_message(chat_id=cid, text=msg)
+                    notified.add(cid)
+                except Exception:
+                    pass
+
+    # 5. Авто-бэкап (раз в сутки)
     global _last_backup_time
     if now - _last_backup_time > 86400:  # 24 часа
         _backup_db(db)
@@ -3231,6 +3375,7 @@ async def post_init(app: Application):
         BotCommand("backup", "Резервная копия"),
         BotCommand("limit", "Задать лимит бюджета"),
         BotCommand("qr", "QR-код для оплаты"),
+        BotCommand("stockalert", "Уведомление по остаткам товара"),
     ])
     log.info("Команды бота зарегистрированы")
 
@@ -3258,6 +3403,7 @@ def main():
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("limit", cmd_limit))
     app.add_handler(CommandHandler("qr", cmd_qr))
+    app.add_handler(CommandHandler("stockalert", cmd_stockalert))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
