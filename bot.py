@@ -25,6 +25,13 @@ GITHUB_REPO = os.getenv("GITHUB_REPO", "")
 DATA_BRANCH = os.getenv("DATA_BRANCH", "data")
 DATA_FILE = os.getenv("DATA_FILE", "db.json")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+try:
+    import anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -595,6 +602,132 @@ def handle_contracts(db, text):
 
 
 # ══════════════════════════════════════════════
+#  AI-ассистент (Claude)
+# ══════════════════════════════════════════════
+
+def _prepare_data_context(db: dict) -> str:
+    """Готовит краткую сводку данных для AI."""
+    parts = []
+
+    bal = calc_balances(db)
+    if bal:
+        lines = []
+        for acc_id, amount in bal.items():
+            lines.append(f"  {get_account_name(db, acc_id)}: {fmt(amount)} сом")
+        parts.append("БАЛАНСЫ СЧЕТОВ:\n" + "\n".join(lines))
+
+    stock = calc_stock(db)
+    noms = {n["id"]: n for n in db.get("trade", {}).get("nomenclature", [])}
+    if stock:
+        lines = []
+        for nid, wh_data in stock.items():
+            total = sum(wh_data.values())
+            n = noms.get(nid, {})
+            lines.append(f"  {n.get('name', nid)}: {fmt(total)} {n.get('unit', 'шт')}")
+        parts.append("ОСТАТКИ НА СКЛАДЕ:\n" + "\n".join(lines))
+
+    debts = calc_debts(db)
+    if debts:
+        lines = []
+        for c_id, amount in debts.items():
+            name = get_contractor_name(db, c_id)
+            if amount > 0:
+                lines.append(f"  {name}: должен нам {fmt(amount)} сом")
+            elif amount < 0:
+                lines.append(f"  {name}: мы должны {fmt(-amount)} сом")
+        if lines:
+            parts.append("ДОЛГИ/ВЗАИМОРАСЧЁТЫ:\n" + "\n".join(lines))
+
+    nom_list = db.get("trade", {}).get("nomenclature", [])
+    if nom_list:
+        lines = []
+        for n in nom_list:
+            lines.append(f"  {n['name']}: цена {fmt(n.get('price', 0))} сом, себест. {fmt(n.get('cost', 0))} сом/{n.get('unit', 'шт')}")
+        parts.append("НОМЕНКЛАТУРА И ЦЕНЫ:\n" + "\n".join(lines))
+
+    contractors = db.get("trade", {}).get("contractors", [])
+    if contractors:
+        lines = [f"  {c['name']} (ИНН: {c.get('inn', '-')}, {c.get('kind', '')}, тел: {c.get('phone', '-')})" for c in contractors]
+        parts.append("КОНТРАГЕНТЫ:\n" + "\n".join(lines))
+
+    employees = db.get("trade", {}).get("employees", [])
+    positions = {p["id"]: p["name"] for p in db.get("trade", {}).get("positions", [])}
+    if employees:
+        lines = [f"  {e['name']} — {positions.get(e.get('position', ''), '?')}, оклад {fmt(e.get('salary', 0))} сом, тел: {e.get('phone', '-')}" for e in employees]
+        parts.append("СОТРУДНИКИ:\n" + "\n".join(lines))
+
+    contracts = db.get("trade", {}).get("contracts", [])
+    if contracts:
+        lines = [f"  №{d.get('number', '?')} от {d.get('date', '?')} — {d.get('name', '')} ({get_contractor_name(db, d.get('contractor', ''))})" for d in contracts]
+        parts.append("ДОГОВОРЫ:\n" + "\n".join(lines))
+
+    org = db.get("trade", {}).get("org", {})
+    if org and org.get("name"):
+        parts.append(f"ОРГАНИЗАЦИЯ: {org['name']}, ИНН: {org.get('inn', '-')}, адрес: {org.get('address', '-')}, тел: {org.get('phone', '-')}")
+
+    pr = db.get("trade", {}).get("payroll", {})
+    if pr:
+        parts.append(f"ЗАРПЛАТНЫЕ СТАВКИ: подоходный {pr.get('incomeTax', 0)}%, соцфонд сотр. {pr.get('sfEmployee', 0)}%, соцфонд работодатель {pr.get('sfEmployer', 0)}%, вычет {pr.get('stdDeduction', 0)} сом, мин. зарплата {pr.get('minSalary', 0)} сом")
+
+    docs = db.get("trade", {}).get("docs", [])
+    if docs:
+        lines = []
+        for d in docs[-10:]:
+            dtype = "Поступление" if d.get("type") in ("postupleniye", "prihod") else "Реализация" if d.get("type") in ("realizaciya", "sale") else d.get("type", "?")
+            total = sum(r.get("total", 0) for r in d.get("rows", [])) or d.get("total", 0)
+            lines.append(f"  {d.get('number', '?')} ({d.get('date', '?')}): {dtype}, {get_contractor_name(db, d.get('contractor', ''))}, сумма {fmt(total)} сом")
+        parts.append("ПОСЛЕДНИЕ ТОРГОВЫЕ ДОКУМЕНТЫ:\n" + "\n".join(lines))
+
+    bank_docs = db.get("bankDocuments", [])
+    cash_docs = db.get("cashDocuments", [])
+    if bank_docs or cash_docs:
+        lines = []
+        for d in (bank_docs + cash_docs)[-10:]:
+            dtype = d.get("type", "?")
+            direction = "приход" if "in" in dtype or "pko" in dtype else "расход"
+            lines.append(f"  {d.get('number', '?')} ({d.get('date', '?')}): {direction} {fmt(d.get('sum', 0))} сом — {d.get('purpose', d.get('note', ''))}")
+        parts.append("ПОСЛЕДНИЕ ДЕНЕЖНЫЕ ДОКУМЕНТЫ:\n" + "\n".join(lines))
+
+    return "\n\n".join(parts)
+
+
+AI_SYSTEM_PROMPT = """Ты — бухгалтерский AI-ассистент компании. Отвечаешь на вопросы по данным учёта.
+
+ПРАВИЛА:
+- Отвечай ТОЛЬКО на основе предоставленных данных. Не выдумывай цифры.
+- Если в данных нет ответа, честно скажи что данных нет.
+- Отвечай кратко, по делу, с конкретными цифрами.
+- Используй эмодзи для структуры (💰📦📊🤝👥 и т.д.)
+- НЕ используй Markdown форматирование (без **, без __, без ```). Только простой текст.
+- Числа форматируй с пробелами (1 000 000).
+- Валюта — сом.
+- Язык — русский."""
+
+
+def ask_ai(question: str, db: dict) -> str | None:
+    """Отправляет вопрос в Claude AI с контекстом данных."""
+    if not ANTHROPIC_API_KEY or not HAS_ANTHROPIC:
+        return None
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        context = _prepare_data_context(db)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            system=AI_SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": f"ДАННЫЕ УЧЁТА:\n{context}\n\nВОПРОС: {question}"
+            }],
+        )
+        text = response.content[0].text.strip()
+        return _esc(text) if text else None
+    except Exception as e:
+        log.error(f"AI ошибка: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════
 #  Маршрутизация
 # ══════════════════════════════════════════════
 
@@ -617,6 +750,12 @@ def process_question(text: str) -> str:
         result = handler(db, text_lower)
         if result is not None:
             return result
+
+    # AI-фоллбэк: если ни один обработчик не сработал
+    ai_answer = ask_ai(text, db)
+    if ai_answer:
+        return f"🤖 {ai_answer}"
+
     return None
 
 
