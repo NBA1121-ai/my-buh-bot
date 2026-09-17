@@ -37,6 +37,13 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 NOTIFY_CHAT_IDS = [int(x) for x in os.getenv("NOTIFY_CHAT_IDS", "").split(",") if x.strip()]
 NOTIFY_MIN_BALANCE = float(os.getenv("NOTIFY_MIN_BALANCE", "5000"))
 
+# Роли доступа: admin = всё, accountant = финансы, warehouse = склад, readonly = только чтение
+_parse_ids = lambda s: {int(x) for x in s.split(",") if x.strip()}
+ADMIN_IDS = _parse_ids(os.getenv("ADMIN_IDS", ""))
+ACCOUNTANT_IDS = _parse_ids(os.getenv("ACCOUNTANT_IDS", ""))
+WAREHOUSE_IDS = _parse_ids(os.getenv("WAREHOUSE_IDS", ""))
+DUPLICATE_ALERT_MINUTES = int(os.getenv("DUPLICATE_ALERT_MINUTES", "60"))
+
 try:
     import anthropic
     HAS_ANTHROPIC = True
@@ -51,6 +58,108 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 plt.rcParams["font.family"] = "DejaVu Sans"
+
+
+# ══════════════════════════════════════════════
+#  Разграничение доступа
+# ══════════════════════════════════════════════
+
+ROLE_ADMIN = "admin"
+ROLE_ACCOUNTANT = "accountant"
+ROLE_WAREHOUSE = "warehouse"
+ROLE_READONLY = "readonly"
+
+def get_user_role(user_id: int) -> str:
+    if not ADMIN_IDS and not ACCOUNTANT_IDS and not WAREHOUSE_IDS:
+        return ROLE_ADMIN  # если роли не настроены — все admin
+    if user_id in ADMIN_IDS:
+        return ROLE_ADMIN
+    if user_id in ACCOUNTANT_IDS:
+        return ROLE_ACCOUNTANT
+    if user_id in WAREHOUSE_IDS:
+        return ROLE_WAREHOUSE
+    return ROLE_READONLY
+
+# Какие разделы доступны каждой роли
+ROLE_PERMISSIONS = {
+    ROLE_ADMIN: {"all"},
+    ROLE_ACCOUNTANT: {"summary", "money", "debts", "price", "payroll", "org",
+                       "contracts", "contractors", "period", "input_money"},
+    ROLE_WAREHOUSE: {"summary", "stock", "goods", "warehouses", "price",
+                      "contractors", "input_trade"},
+    ROLE_READONLY: {"summary", "stock", "money", "debts", "goods", "price",
+                     "contractors", "employees", "org", "payroll", "contracts", "period"},
+}
+
+def has_permission(role: str, section: str) -> bool:
+    perms = ROLE_PERMISSIONS.get(role, set())
+    return "all" in perms or section in perms
+
+ACCESS_DENIED_MSG = "🔒 У вас нет доступа к этому разделу\\."
+
+
+# ══════════════════════════════════════════════
+#  История запросов (дубли)
+# ══════════════════════════════════════════════
+
+# {topic_key: [(user_id, user_first_name, timestamp), ...]}
+_query_history: dict[str, list[tuple[int, str, float]]] = {}
+
+def record_query(topic_key: str, user_id: int, user_name: str):
+    """Записывает запрос в историю."""
+    now = time.time()
+    if topic_key not in _query_history:
+        _query_history[topic_key] = []
+    # Чистим старые записи (старше DUPLICATE_ALERT_MINUTES)
+    cutoff = now - DUPLICATE_ALERT_MINUTES * 60
+    _query_history[topic_key] = [(uid, uname, ts) for uid, uname, ts in _query_history[topic_key] if ts > cutoff]
+    _query_history[topic_key].append((user_id, user_name, now))
+
+
+def check_duplicate_query(topic_key: str, user_id: int) -> str | None:
+    """Проверяет, спрашивал ли кто-то другой о том же недавно."""
+    now = time.time()
+    cutoff = now - DUPLICATE_ALERT_MINUTES * 60
+    entries = _query_history.get(topic_key, [])
+    others = [(uid, uname, ts) for uid, uname, ts in entries if uid != user_id and ts > cutoff]
+    if not others:
+        return None
+    # Берём последний запрос от другого
+    uid, uname, ts = others[-1]
+    mins_ago = int((now - ts) / 60)
+    if mins_ago < 1:
+        time_str = "только что"
+    elif mins_ago < 60:
+        time_str = f"{mins_ago} мин. назад"
+    else:
+        time_str = f"{mins_ago // 60} ч. {mins_ago % 60} мин. назад"
+    return (f"\n\n⚠️ {_esc(uname)} уже спрашивал об этом {_esc(time_str)}\\. "
+            f"Уточните у него/неё — возможно, товар уже взят или вопрос решён\\.")
+
+
+def _extract_query_topic(text: str, db: dict) -> str | None:
+    """Извлекает ключ темы для отслеживания дублей (товар/контрагент)."""
+    text_lower = text.lower()
+    # Проверяем товары
+    noms = db.get("trade", {}).get("nomenclature", [])
+    for n in noms:
+        if fuzzy_match_any_word(text_lower, n.get("name", "")):
+            return f"nom:{n['id']}"
+    # Проверяем контрагентов
+    for c in db.get("trade", {}).get("contractors", []):
+        if fuzzy_match_any_word(text_lower, c.get("name", "")):
+            return f"con:{c['id']}"
+    return None
+
+
+def fuzzy_match_any_word(text: str, name: str) -> bool:
+    """Проверяет есть ли хотя бы одно значимое слово из name в text."""
+    name_words = [w for w in name.lower().split() if len(w) > 3]
+    text_stems = {stem(w) for w in text.split()}
+    for nw in name_words:
+        if stem(nw) in text_stems or nw in text:
+            return True
+    return False
 
 
 # ══════════════════════════════════════════════
@@ -1031,6 +1140,174 @@ def handle_period_report(db, text):
 
 
 # ══════════════════════════════════════════════
+#  Ввод данных через бота
+# ══════════════════════════════════════════════
+
+import base64
+import uuid
+
+def _push_db(db: dict, message: str) -> bool:
+    """Записывает db.json обратно в GitHub."""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DATA_FILE}?ref={DATA_BRANCH}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    # Получаем текущий SHA
+    resp = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        log.error(f"push_db: get SHA failed {resp.status_code}")
+        return False
+    sha = resp.json().get("sha", "")
+    content = base64.b64encode(json.dumps(db, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii")
+    put_resp = requests.put(
+        f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DATA_FILE}",
+        headers=headers, timeout=30,
+        json={"message": message, "content": content, "sha": sha, "branch": DATA_BRANCH},
+    )
+    if put_resp.status_code in (200, 201):
+        global _db_cache, _db_cache_time
+        _db_cache = db
+        _db_cache_time = time.time()
+        return True
+    log.error(f"push_db: put failed {put_resp.status_code}: {put_resp.text[:200]}")
+    return False
+
+
+_INPUT_PATTERNS = [
+    # приход 15000 от Альфа Трейд на банк
+    (r"приход\s+([\d\s]+(?:[.,]\d+)?)\s+(?:от\s+)?(.+?)\s+(?:на\s+)?(банк|касс[ау]?)",
+     "payment_in", "money"),
+    # расход 8000 на Бета Снаб с банка
+    (r"расход\s+([\d\s]+(?:[.,]\d+)?)\s+(?:на\s+|для\s+)?(.+?)\s+(?:с\s+|из\s+)?(банк|касс[ау]?)",
+     "payment_out", "money"),
+    # поступление 5 ноутбуков от Бета Снаб
+    (r"поступлени[ея]\s+(\d+)\s+(.+?)\s+(?:от\s+)(.+)",
+     "postupleniye", "trade"),
+    # реализация 3 мышек для Альфа Трейд
+    (r"реализаци[яю]\s+(\d+)\s+(.+?)\s+(?:для|клиенту|покупателю)\s+(.+)",
+     "realizaciya", "trade"),
+]
+
+
+def parse_input_command(text: str, db: dict):
+    """Пытается распарсить команду ввода данных. Возвращает (doc_dict, description) или None."""
+    t = text.lower().strip()
+
+    for pattern, doc_type, category in _INPUT_PATTERNS:
+        m = re.search(pattern, t)
+        if not m:
+            continue
+
+        if category == "money":
+            amount_str = m.group(1).replace(" ", "").replace(",", ".")
+            try:
+                amount = float(amount_str)
+            except ValueError:
+                continue
+            contractor_q = m.group(2).strip()
+            acc_type = m.group(3).strip()
+
+            # Найти контрагента
+            found_c = find_contractor(db, contractor_q)
+            c_id = found_c[0]["id"] if found_c else ""
+            c_name = found_c[0]["name"] if found_c else contractor_q
+
+            # Выбрать первый счёт/кассу нужного типа
+            is_cash = "касс" in acc_type
+            if is_cash:
+                cashs = db.get("cashs", [])
+                cash_id = cashs[0]["id"] if cashs else "_1"
+                acc_name = cashs[0]["name"] if cashs else "Касса"
+                real_type = "cash_in" if "in" in doc_type else "cash_out"
+                doc = {
+                    "id": str(uuid.uuid4())[:8],
+                    "type": real_type,
+                    "number": f"Бот-{datetime.now().strftime('%H%M%S')}",
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "status": "conducted",
+                    "cash": cash_id,
+                    "contractor": c_id,
+                    "article": "_1" if "in" in doc_type else "_5",
+                    "currency": "", "sum": amount, "rate": 1,
+                    "purpose": f"{'Приход от' if 'in' in real_type else 'Расход на'} {c_name}",
+                    "note": f"Создано через бота",
+                    "created": datetime.now().isoformat() + "Z",
+                }
+                collection = "cashDocuments"
+            else:
+                accounts = db.get("accounts", [])
+                bank_acc = next((a for a in accounts if a.get("type") == "bank"), accounts[0] if accounts else {"id": "_1", "name": "Счёт"})
+                acc_name = bank_acc.get("name", "Счёт")
+                doc = {
+                    "id": str(uuid.uuid4())[:8],
+                    "type": doc_type,
+                    "number": f"Бот-{datetime.now().strftime('%H%M%S')}",
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "status": "conducted",
+                    "account": bank_acc["id"],
+                    "contractor": c_id,
+                    "article": "_1" if doc_type == "payment_in" else "_5",
+                    "currency": "", "sum": amount, "rate": 1,
+                    "purpose": f"{'Оплата от' if doc_type == 'payment_in' else 'Оплата для'} {c_name}",
+                    "note": f"Создано через бота",
+                    "created": datetime.now().isoformat() + "Z",
+                }
+                collection = "bankDocuments"
+
+            direction = "Приход" if "in" in doc.get("type", "") else "Расход"
+            desc = f"{direction} {fmt(amount)} сом, {c_name}, {acc_name}"
+            return doc, collection, desc
+
+        elif category == "trade":
+            qty = int(m.group(1))
+            nom_q = m.group(2).strip()
+            contractor_q = m.group(3).strip()
+
+            found_n = find_nomenclature(db, nom_q)
+            if not found_n:
+                return None
+            nom = found_n[0]
+            found_c = find_contractor(db, contractor_q)
+            c_id = found_c[0]["id"] if found_c else ""
+            c_name = found_c[0]["name"] if found_c else contractor_q
+            price = nom.get("cost", 0) if doc_type == "postupleniye" else nom.get("price", 0)
+            total = qty * price
+
+            warehouses = db.get("trade", {}).get("warehouses", [])
+            wh_id = warehouses[0]["id"] if warehouses else "w1"
+
+            doc = {
+                "id": str(uuid.uuid4())[:8],
+                "type": doc_type,
+                "number": f"Бот-{datetime.now().strftime('%H%M%S')}",
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "status": "conducted",
+                "contractor": c_id,
+                "contract": "",
+                "warehouse": wh_id,
+                "note": f"Создано через бота",
+                "rows": [{"nomenclature": nom["id"], "qty": qty, "price": price, "total": total}],
+                "total": total,
+                "created": datetime.now().isoformat() + "Z",
+            }
+            collection = "trade_docs"
+            dtype_ru = "Поступление" if doc_type == "postupleniye" else "Реализация"
+            desc = f"{dtype_ru}: {nom['name']} x{qty} = {fmt(total)} сом, {c_name}"
+            return doc, collection, desc
+
+    return None
+
+
+def save_document(db: dict, doc: dict, collection: str, commit_msg: str) -> bool:
+    """Сохраняет документ в db и пушит в GitHub."""
+    import copy
+    db = copy.deepcopy(db)
+    if collection == "trade_docs":
+        db.setdefault("trade", {}).setdefault("docs", []).append(doc)
+    else:
+        db.setdefault(collection, []).append(doc)
+    return _push_db(db, commit_msg)
+
+
+# ══════════════════════════════════════════════
 #  AI-ассистент (Claude)
 # ══════════════════════════════════════════════
 
@@ -1182,13 +1459,15 @@ HELP_MD = (
     f"  📈 _Сводка / Отчёт_\n"
     f"  📅 _Продажи за сентябрь / Расходы за неделю_\n"
     f"  📋 _Список товаров_\n"
-    f"  🤝 _Контрагенты_\n"
-    f"  👥 _Сотрудники_\n"
-    f"  📝 _Договоры_\n"
-    f"  🏢 _Реквизиты организации_\n"
-    f"  💼 _Зарплатные ставки_\n\n"
+    f"  🤝 _Контрагенты / 👥 Сотрудники_\n"
+    f"  📝 _Договоры / 🏢 Реквизиты / 💼 Зарплата_\n\n"
     f"📊 _График баланса / График склада_\n"
     f"📥 _Выгрузи склад / Выгрузи балансы_\n\n"
+    f"✏️ *Ввод данных:*\n"
+    f"  _приход 15000 от Альфа Трейд на банк_\n"
+    f"  _расход 8000 на Бета Снаб с кассы_\n"
+    f"  _поступление 5 ноутбуков от Бета Снаб_\n"
+    f"  _реализация 3 мышек для Альфа Трейд_\n\n"
     f"Или нажмите кнопку ниже 👇"
 )
 
@@ -1269,6 +1548,38 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif chart_type == "income":
             await _send_chart(chat, chart_income_expense(db), "🔄 Приходы и расходы", "Нет денежных операций.")
 
+    elif data.startswith("confirm:"):
+        confirm_id = data[8:]
+        pending = context.user_data.pop(f"pending_{confirm_id}", None)
+        if not pending:
+            await query.message.edit_text("⏰ Время подтверждения истекло.")
+            return
+        doc, collection, desc = pending
+        await chat.send_action(ChatAction.TYPING)
+        try:
+            db = fetch_db()
+            ok = save_document(db, doc, collection, f"Бот: {desc}")
+            if ok:
+                await query.message.edit_text(f"✅ Документ создан!\n\n{desc}")
+                # Уведомляем всех подписанных
+                for cid in _notify_chat_ids:
+                    if cid != chat.id:
+                        try:
+                            user_name = query.from_user.first_name or "?"
+                            await context.bot.send_message(cid, f"📝 {user_name} создал документ:\n{desc}")
+                        except Exception:
+                            pass
+            else:
+                await query.message.edit_text("❌ Ошибка при сохранении. Попробуйте позже.")
+        except Exception as e:
+            log.error(f"Confirm error: {e}")
+            await query.message.edit_text("❌ Ошибка при сохранении.")
+
+    elif data.startswith("cancel:"):
+        confirm_id = data[7:]
+        context.user_data.pop(f"pending_{confirm_id}", None)
+        await query.message.edit_text("❌ Операция отменена.")
+
     elif data.startswith("xlsx:"):
         await chat.send_action(ChatAction.UPLOAD_DOCUMENT)
         try:
@@ -1290,12 +1601,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if not text:
         return
-    log.info(f"[{update.effective_user.first_name}] {text}")
+    user = update.effective_user
+    user_id = user.id
+    user_name = user.first_name or "?"
+    role = get_user_role(user_id)
+    log.info(f"[{user_name} id={user_id} role={role}] {text}")
 
     await update.message.chat.send_action(ChatAction.TYPING)
     text_lower = text.lower().strip()
 
-    # Запрос графика текстом
+    # ── Ввод данных ──
+    input_kw = ["приход ", "расход ", "поступление ", "реализация "]
+    if any(text_lower.startswith(k) for k in input_kw):
+        # Проверка прав на ввод
+        is_money = text_lower.startswith("приход") or text_lower.startswith("расход")
+        needed = "input_money" if is_money else "input_trade"
+        if not has_permission(role, needed):
+            await update.message.reply_text(ACCESS_DENIED_MSG, parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        try:
+            db = fetch_db()
+            result = parse_input_command(text, db)
+            if result:
+                doc, collection, desc = result
+                # Подтверждение через кнопки
+                confirm_id = str(uuid.uuid4())[:8]
+                context.user_data[f"pending_{confirm_id}"] = (doc, collection, desc)
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm:{confirm_id}"),
+                     InlineKeyboardButton("❌ Отмена", callback_data=f"cancel:{confirm_id}")],
+                ])
+                await update.message.reply_text(
+                    f"📝 {_bold('Новый документ')}\n\n{_esc(desc)}\n\nПодтвердить?",
+                    parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb,
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Не удалось распознать команду\\.\n\n"
+                    f"Примеры:\n"
+                    f"  {_esc('приход 15000 от Альфа Трейд на банк')}\n"
+                    f"  {_esc('расход 8000 на Бета Снаб с кассы')}\n"
+                    f"  {_esc('поступление 5 ноутбуков от Бета Снаб')}\n"
+                    f"  {_esc('реализация 3 мышек для Альфа Трейд')}",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+        except Exception as e:
+            log.error(f"Input error: {e}")
+            await update.message.reply_text("⚠️ Ошибка при обработке команды.")
+        return
+
+    # ── Графики ──
     chart_kw = {"график баланс": "balances", "график счет": "balances", "график счёт": "balances",
                 "график склад": "stock", "график остат": "stock",
                 "график долг": "debts", "график взаиморасч": "debts",
@@ -1314,7 +1669,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⚠️ Ошибка при создании графика.")
             return
 
-    # Запрос Excel текстом
+    # ── Excel ──
     xlsx_kw = {"выгрузи баланс": "balances", "выгрузи счет": "balances", "excel баланс": "balances",
                "выгрузи склад": "stock", "excel склад": "stock", "выгрузи остат": "stock",
                "выгрузи долг": "debts", "excel долг": "debts", "выгрузи взаиморасч": "debts",
@@ -1344,7 +1699,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⚠️ Ошибка при создании файла.")
             return
 
-    # Запрос Excel за период текстом
+    # ── Excel за период ──
     if "выгрузи" in text_lower or "excel" in text_lower:
         period = parse_period(text_lower)
         if period:
@@ -1360,10 +1715,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⚠️ Ошибка при создании файла.")
             return
 
-    # Обычный текстовый ответ
+    # ── Обычный текстовый ответ ──
     answer = process_question(text)
     if not answer:
         answer = f"🤔 Не совсем понял вопрос\\.\n\n{HELP_MD}"
+
+    # ── Проверка дублей запросов ──
+    duplicate_warning = ""
+    try:
+        db = fetch_db()
+        topic = _extract_query_topic(text_lower, db)
+        if topic:
+            duplicate_warning = check_duplicate_query(topic, user_id) or ""
+            record_query(topic, user_id, user_name)
+    except Exception:
+        pass
+
+    if duplicate_warning:
+        answer += duplicate_warning
 
     if len(answer) > 4000:
         answer = answer[:4000] + "\n\n\\.\\.\\. \\(обрезано\\)"
