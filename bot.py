@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import time
+import hashlib
 from datetime import datetime, timedelta
 from PIL import Image
 import pytesseract
@@ -21,6 +22,7 @@ import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 import requests
 from dotenv import load_dotenv
+import qrcode
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -45,6 +47,13 @@ ADMIN_IDS = _parse_ids(os.getenv("ADMIN_IDS", ""))
 ACCOUNTANT_IDS = _parse_ids(os.getenv("ACCOUNTANT_IDS", ""))
 WAREHOUSE_IDS = _parse_ids(os.getenv("WAREHOUSE_IDS", ""))
 DUPLICATE_ALERT_MINUTES = int(os.getenv("DUPLICATE_ALERT_MINUTES", "60"))
+
+# Лимиты бюджетов (JSON-строка: {"расходы": 100000, "зарплата": 50000})
+BUDGET_LIMITS = json.loads(os.getenv("BUDGET_LIMITS", "{}"))
+BUDGET_PERIOD_DAYS = int(os.getenv("BUDGET_PERIOD_DAYS", "30"))
+
+# Авто-бэкап
+BACKUP_BRANCH = os.getenv("BACKUP_BRANCH", "backup")
 
 # 1С подключение (OData)
 ODATA_URL = os.getenv("ODATA_URL", "")  # http://server/base/odata/standard.odata
@@ -1619,6 +1628,367 @@ def t(user_id: int, key: str, **kwargs) -> str:
 
 
 # ══════════════════════════════════════════════
+#  1. Напоминания / задачи
+# ══════════════════════════════════════════════
+
+# {user_id: [{"text": str, "at": datetime, "job_name": str}, ...]}
+_reminders: dict[int, list] = {}
+
+_REMIND_RE = re.compile(
+    r"(?:напомни|remind|эскерт)"
+    r".*?(?:через|in)\s+(\d+)\s*(часов|часа|час|минут|минуты|мин|дней|дня|день|дн|hours?|minutes?|min|days?)\b",
+    re.IGNORECASE,
+)
+_REMIND_AT_RE = re.compile(
+    r"(?:напомни|remind|эскерт)"
+    r".*?(?:завтра|сегодня|tomorrow|today)?\s*(?:в|at)\s+(\d{1,2})[:\.]?(\d{2})?\b",
+    re.IGNORECASE,
+)
+
+def _parse_reminder(text: str):
+    """Парсит текст напоминания → (timedelta | datetime, текст)."""
+    m = _REMIND_RE.search(text)
+    if m:
+        val = int(m.group(1))
+        unit = m.group(2).lower()
+        if unit.startswith("час") or unit.startswith("hour"):
+            delta = timedelta(hours=val)
+        elif unit.startswith("мин") or unit.startswith("min"):
+            delta = timedelta(minutes=val)
+        elif unit.startswith("ден") or unit.startswith("дн") or unit.startswith("day"):
+            delta = timedelta(days=val)
+        else:
+            delta = timedelta(minutes=val)
+        # Текст напоминания — всё после временной части
+        reminder_text = text[m.end():].strip()
+        if not reminder_text:
+            reminder_text = text[:m.start()].strip()
+        # Очистить "напомни через 2 часа" часть
+        for prefix in ["напомни", "remind", "эскерт"]:
+            reminder_text = re.sub(rf"^\s*{prefix}\s*", "", reminder_text, flags=re.IGNORECASE)
+        reminder_text = reminder_text.strip(" ,.!-—")
+        return delta, reminder_text or "Напоминание"
+
+    m2 = _REMIND_AT_RE.search(text)
+    if m2:
+        hour = int(m2.group(1))
+        minute = int(m2.group(2) or 0)
+        now = datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if "завтра" in text.lower() or "tomorrow" in text.lower():
+            target += timedelta(days=1)
+        elif target <= now:
+            target += timedelta(days=1)
+        reminder_text = text[m2.end():].strip()
+        if not reminder_text:
+            reminder_text = text[:m2.start()].strip()
+        for prefix in ["напомни", "remind", "эскерт"]:
+            reminder_text = re.sub(rf"^\s*{prefix}\s*", "", reminder_text, flags=re.IGNORECASE)
+        reminder_text = reminder_text.strip(" ,.!-—")
+        return target, reminder_text or "Напоминание"
+
+    return None, None
+
+
+async def _fire_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Callback, который срабатывает по таймеру."""
+    data = context.job.data
+    chat_id = data["chat_id"]
+    text = data["text"]
+    user_id = data["user_id"]
+    await context.bot.send_message(chat_id=chat_id, text=f"🔔 *Напоминание:*\n\n{_esc(text)}", parse_mode=ParseMode.MARKDOWN_V2)
+    # Удалить из списка
+    rems = _reminders.get(user_id, [])
+    _reminders[user_id] = [r for r in rems if r.get("job_name") != context.job.name]
+
+
+# ══════════════════════════════════════════════
+#  2. Аудит-лог
+# ══════════════════════════════════════════════
+
+_audit_log: list[dict] = []  # in-memory, также сохраняется в db.json
+
+def audit_record(user_id: int, user_name: str, action: str, detail: str = ""):
+    """Записывает действие в аудит-лог."""
+    entry = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "user_id": user_id,
+        "user": user_name,
+        "action": action,
+        "detail": detail[:200],
+    }
+    _audit_log.append(entry)
+    # Ограничиваем in-memory лог
+    if len(_audit_log) > 1000:
+        _audit_log.pop(0)
+
+def save_audit_to_db(db: dict):
+    """Добавляет аудит-лог в db.json (append-only)."""
+    existing = db.get("audit_log", [])
+    existing.extend(_audit_log)
+    # Ограничиваем до 5000 записей
+    if len(existing) > 5000:
+        existing = existing[-5000:]
+    db["audit_log"] = existing
+
+def handle_audit(db, text):
+    """Обработчик: 'аудит', 'лог действий', 'кто что делал'."""
+    kw = ["аудит", "лог действ", "кто что дела", "история действ", "журнал"]
+    if not any(k in text for k in kw):
+        return None
+    log_entries = db.get("audit_log", []) + _audit_log
+    if not log_entries:
+        return "📋 Аудит\\-лог пуст\\."
+    # Последние 20 записей
+    recent = log_entries[-20:]
+    lines = ["📋 *Аудит\\-лог* \\(последние записи\\):\n"]
+    for e in reversed(recent):
+        ts = _esc(e.get("ts", ""))
+        user = _esc(e.get("user", "?"))
+        action = _esc(e.get("action", ""))
+        detail = _esc(e.get("detail", ""))
+        lines.append(f"  `{ts}` *{user}*: {action}")
+        if detail:
+            lines.append(f"    _{detail}_")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════
+#  3. PDF-отчёты
+# ══════════════════════════════════════════════
+
+def _generate_pdf_report(db: dict) -> bytes | None:
+    """Генерирует PDF с графиками и таблицами."""
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    buf = io.BytesIO()
+    with PdfPages(buf) as pdf:
+        # Страница 1: Сводка
+        fig, ax = plt.subplots(figsize=(8, 10))
+        fig.patch.set_facecolor("#1e1e2e")
+        ax.set_facecolor("#1e1e2e")
+        ax.axis("off")
+
+        now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+        lines_text = [f"Отчёт my-buh — {now_str}", ""]
+
+        # Баланс
+        bal = calc_balances(db)
+        total = sum(bal.values())
+        lines_text.append(f"[*] Общий баланс: {fmt(total)} сом")
+        for acc_id, amount in sorted(bal.items(), key=lambda x: -x[1]):
+            name = get_account_name(db, acc_id)
+            lines_text.append(f"  • {name}: {fmt(amount)} сом")
+        lines_text.append("")
+
+        # Склад
+        stock_raw = calc_stock(db)
+        stock_total = {gid: sum(wh.values()) for gid, wh in stock_raw.items()}
+        lines_text.append(f"[=] Склад ({len(stock_total)} позиций)")
+        for gid, qty in sorted(stock_total.items(), key=lambda x: -x[1])[:10]:
+            name = get_nom_name(db, gid)
+            lines_text.append(f"  • {name}: {fmt(qty)}")
+        lines_text.append("")
+
+        # Долги
+        debts = calc_debts(db)
+        us_owe = {k: v for k, v in debts.items() if v < 0}
+        they_owe = {k: v for k, v in debts.items() if v > 0}
+        lines_text.append(f"[+] Нам должны: {fmt(sum(they_owe.values()))} сом ({len(they_owe)} к-агентов)")
+        lines_text.append(f"[-] Мы должны: {fmt(abs(sum(us_owe.values())))} сом ({len(us_owe)} к-агентов)")
+
+        ax.text(0.05, 0.95, "\n".join(lines_text), transform=ax.transAxes,
+                fontsize=10, verticalalignment="top", color="white",
+                fontfamily="monospace")
+        pdf.savefig(fig, facecolor=fig.get_facecolor())
+        plt.close(fig)
+
+        # Страница 2: График баланса
+        chart = chart_balances(db)
+        if chart:
+            fig2, ax2 = plt.subplots(figsize=(8, 5))
+            ax2.axis("off")
+            img = Image.open(io.BytesIO(chart))
+            ax2.imshow(img)
+            pdf.savefig(fig2)
+            plt.close(fig2)
+
+        # Страница 3: График склада
+        chart = chart_stock(db)
+        if chart:
+            fig3, ax3 = plt.subplots(figsize=(8, 5))
+            ax3.axis("off")
+            img = Image.open(io.BytesIO(chart))
+            ax3.imshow(img)
+            pdf.savefig(fig3)
+            plt.close(fig3)
+
+    buf.seek(0)
+    return buf.read()
+
+
+# ══════════════════════════════════════════════
+#  4. Авто-бэкап db.json
+# ══════════════════════════════════════════════
+
+def _backup_db(db: dict) -> bool:
+    """Бэкапит db.json в ветку backup с таймстемпом."""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return False
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_file = f"db_backup_{timestamp}.json"
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{backup_file}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    content = base64.b64encode(json.dumps(db, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii")
+    resp = requests.put(
+        url, headers=headers, timeout=30,
+        json={"message": f"Auto-backup {timestamp}", "content": content, "branch": BACKUP_BRANCH},
+    )
+    if resp.status_code in (200, 201):
+        log.info(f"Backup saved: {backup_file}")
+        return True
+    # Ветка может не существовать — создадим
+    if resp.status_code == 422 or resp.status_code == 404:
+        # Пытаемся создать ветку backup из main
+        ref_resp = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/git/refs/heads/main",
+            headers=headers, timeout=15,
+        )
+        if ref_resp.status_code == 200:
+            sha = ref_resp.json()["object"]["sha"]
+            requests.post(
+                f"https://api.github.com/repos/{GITHUB_REPO}/git/refs",
+                headers=headers, timeout=15,
+                json={"ref": f"refs/heads/{BACKUP_BRANCH}", "sha": sha},
+            )
+            # Повторяем запись
+            resp2 = requests.put(
+                url, headers=headers, timeout=30,
+                json={"message": f"Auto-backup {timestamp}", "content": content, "branch": BACKUP_BRANCH},
+            )
+            if resp2.status_code in (200, 201):
+                log.info(f"Backup saved (new branch): {backup_file}")
+                return True
+    log.error(f"Backup failed: {resp.status_code}")
+    return False
+
+
+# ══════════════════════════════════════════════
+#  6. Лимиты и бюджеты
+# ══════════════════════════════════════════════
+
+# In-memory лимиты (можно задать через .env или команду /limit)
+_budget_limits: dict[str, float] = dict(BUDGET_LIMITS)  # {"расходы": 100000, ...}
+
+def _check_budget_alerts(db: dict) -> list[str]:
+    """Проверяет превышение бюджетов за текущий период."""
+    if not _budget_limits:
+        return []
+    now = datetime.now()
+    period_start = now - timedelta(days=BUDGET_PERIOD_DAYS)
+    alerts = []
+
+    # Считаем расходы за период
+    total_expense = 0.0
+    for doc in db.get("bankDocuments", []) + db.get("cashDocuments", []):
+        dtype = doc.get("type", "")
+        if "out" in dtype or "rko" in dtype:
+            doc_date = doc.get("date", "")
+            try:
+                d = datetime.strptime(doc_date[:10], "%Y-%m-%d")
+                if d >= period_start:
+                    total_expense += float(doc.get("sum", 0))
+            except (ValueError, TypeError):
+                pass
+
+    # Зарплата за период
+    total_payroll = 0.0
+    for emp in db.get("employees", []):
+        total_payroll += float(emp.get("salary", 0))
+
+    limits_map = {
+        "расходы": total_expense,
+        "расход": total_expense,
+        "expense": total_expense,
+        "зарплата": total_payroll,
+        "payroll": total_payroll,
+    }
+
+    for name, limit in _budget_limits.items():
+        actual = limits_map.get(name.lower(), 0)
+        if actual > limit:
+            pct = (actual / limit * 100) if limit > 0 else 0
+            alerts.append(f"⚠️ {name}: {fmt(actual)} / {fmt(limit)} сом ({pct:.0f}%)")
+        elif actual > limit * 0.8:
+            pct = (actual / limit * 100) if limit > 0 else 0
+            alerts.append(f"⚡ {name}: {fmt(actual)} / {fmt(limit)} сом ({pct:.0f}%) — близко к лимиту")
+
+    return alerts
+
+
+def handle_budget(db, text):
+    """Обработчик: 'лимиты', 'бюджет', 'превышение'."""
+    kw = ["лимит", "бюджет", "превышен", "budget", "limit"]
+    if not any(k in text for k in kw):
+        return None
+
+    if not _budget_limits:
+        return (
+            "📊 *Лимиты бюджетов*\n\n"
+            "Лимиты не заданы\\.\n\n"
+            "Задайте в \\.env:\n"
+            "`BUDGET_LIMITS={\"расходы\": 100000}`\n\n"
+            "Или через бота:\n"
+            "`/limit расходы 100000`"
+        )
+
+    lines = ["📊 *Лимиты бюджетов*\n"]
+    alerts = _check_budget_alerts(db)
+    if alerts:
+        for a in alerts:
+            lines.append(f"  {_esc(a)}")
+    else:
+        lines.append("  ✅ Все лимиты в норме")
+
+    lines.append(f"\n_Период: {BUDGET_PERIOD_DAYS} дней_")
+    lines.append("\nУстановленные лимиты:")
+    for name, limit in _budget_limits.items():
+        lines.append(f"  • {_esc(name)}: {_esc(fmt(limit))} сом")
+
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════
+#  9. QR-код для оплаты
+# ══════════════════════════════════════════════
+
+def _generate_qr(text: str) -> bytes:
+    """Генерирует QR-код в PNG."""
+    qr = qrcode.QRCode(version=1, box_size=10, border=4)
+    qr.add_data(text)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf.read()
+
+def _find_contractor_requisites(db: dict, text: str) -> dict | None:
+    """Ищет реквизиты контрагента для QR."""
+    contractors = db.get("contractors", [])
+    for c in contractors:
+        name = c.get("name", "").lower()
+        if name and name in text:
+            return c
+    # Нечёткий поиск
+    search = clean_search(text, ["qr", "кюар", "оплат", "реквизит", "перевод", "код"])
+    for c in contractors:
+        if fuzzy_match(search, c.get("name", "")):
+            return c
+    return None
+
+
+# ══════════════════════════════════════════════
 #  Избранные запросы
 # ══════════════════════════════════════════════
 
@@ -2042,6 +2412,7 @@ def ask_ai(question: str, db: dict) -> str | None:
 HANDLERS = [
     handle_summary, handle_doc_search, handle_1c, handle_period_report,
     handle_forecast, handle_compare, handle_top,
+    handle_audit, handle_budget,
     handle_money, handle_debts, handle_price,
     handle_payroll, handle_org, handle_contracts, handle_warehouses,
     handle_stock, handle_goods, handle_contractors, handle_employees,
@@ -2090,7 +2461,10 @@ MAIN_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("📥 Excel: Долги", callback_data="xlsx:debts")],
     [InlineKeyboardButton("📈 Прогноз", callback_data="q:прогноз"),
      InlineKeyboardButton("🏆 Топ товаров", callback_data="q:топ товаров")],
-    [InlineKeyboardButton("⭐ Избранное", callback_data="cmd:fav")],
+    [InlineKeyboardButton("⭐ Избранное", callback_data="cmd:fav"),
+     InlineKeyboardButton("📋 Аудит", callback_data="q:аудит")],
+    [InlineKeyboardButton("📄 PDF-отчёт", callback_data="cmd:pdf"),
+     InlineKeyboardButton("📊 Бюджет", callback_data="q:лимиты")],
 ])
 
 HELP_MD = (
@@ -2119,8 +2493,15 @@ HELP_MD = (
     f"📈 _Прогноз / Прогноз баланса_\n"
     f"📊 _Сравни сентябрь с августом_\n"
     f"🏆 _Топ товаров / Топ контрагентов / Топ расходов_\n\n"
-    f"⭐ /save \\<имя\\> — сохранить последний запрос\n"
-    f"⭐ /fav — список избранных запросов\n\n"
+    f"⭐ /save \\<имя\\> — сохранить запрос\n"
+    f"⭐ /fav — избранные запросы\n\n"
+    f"🔔 _Напомни через 2 часа проверить оплату_\n"
+    f"📋 _Аудит / Лог действий_\n"
+    f"📊 _Лимиты / Бюджет_\n"
+    f"📄 /pdf — PDF\\-отчёт с графиками\n"
+    f"💾 /backup — резервная копия данных\n"
+    f"🔲 /qr \\<контрагент\\> — QR для оплаты\n"
+    f"/limit \\<название\\> \\<сумма\\> — задать лимит\n\n"
     f"Или нажмите кнопку ниже 👇"
 )
 
@@ -2189,6 +2570,155 @@ async def cmd_fav(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     kb = InlineKeyboardMarkup(buttons)
     await update.message.reply_text("⭐ *Избранные запросы:*", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+
+async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Напоминание: /remind <через 2 часа текст>"""
+    text = " ".join(context.args).strip() if context.args else ""
+    if not text:
+        await update.message.reply_text("🔔 Использование:\n/remind через 2 часа проверить оплату\n/remind завтра в 9:00 позвонить поставщику")
+        return
+    when, reminder_text = _parse_reminder(text)
+    if when is None:
+        await update.message.reply_text("❌ Не смог распознать время. Примеры:\n/remind через 30 минут ...\n/remind завтра в 10:00 ...")
+        return
+    user = update.effective_user
+    if isinstance(when, timedelta):
+        fire_at = datetime.now() + when
+        delay = when.total_seconds()
+    else:
+        fire_at = when
+        delay = (when - datetime.now()).total_seconds()
+    if delay <= 0:
+        await update.message.reply_text("❌ Время уже прошло.")
+        return
+    job_name = f"rem_{user.id}_{int(time.time())}"
+    context.application.job_queue.run_once(
+        _fire_reminder, when=delay,
+        data={"chat_id": update.effective_chat.id, "text": reminder_text, "user_id": user.id},
+        name=job_name,
+    )
+    _reminders.setdefault(user.id, []).append({"text": reminder_text, "at": fire_at, "job_name": job_name})
+    time_str = fire_at.strftime("%d.%m.%Y %H:%M")
+    await update.message.reply_text(f"🔔 Напоминание установлено на *{_esc(time_str)}*\n\n_{_esc(reminder_text)}_", parse_mode=ParseMode.MARKDOWN_V2)
+
+async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список активных напоминаний."""
+    uid = update.effective_user.id
+    rems = _reminders.get(uid, [])
+    if not rems:
+        await update.message.reply_text("🔔 У вас нет активных напоминаний.")
+        return
+    lines = ["🔔 *Ваши напоминания:*\n"]
+    for r in rems:
+        at = r["at"].strftime("%d.%m.%Y %H:%M") if isinstance(r["at"], datetime) else str(r["at"])
+        lines.append(f"  ⏰ {_esc(at)} — _{_esc(r['text'])}_")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+
+async def cmd_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Генерирует PDF-отчёт."""
+    await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+    try:
+        db = fetch_db()
+        pdf_bytes = _generate_pdf_report(db)
+        if pdf_bytes:
+            today = datetime.now().strftime("%Y-%m-%d")
+            await update.message.chat.send_document(
+                document=pdf_bytes,
+                filename=f"Отчёт_{today}.pdf",
+                caption="📄 PDF-отчёт с графиками и сводкой",
+            )
+        else:
+            await update.message.reply_text("❌ Не удалось создать отчёт.")
+    except Exception as e:
+        log.error(f"PDF error: {e}")
+        await update.message.reply_text("⚠️ Ошибка при создании PDF.")
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Резервное копирование db.json."""
+    uid = update.effective_user.id
+    role = get_user_role(uid)
+    if role not in ("admin",):
+        await update.message.reply_text("❌ Только администратор может создавать бэкапы.")
+        return
+    await update.message.chat.send_action(ChatAction.TYPING)
+    try:
+        db = fetch_db()
+        # Сохраняем аудит перед бэкапом
+        save_audit_to_db(db)
+        ok = _backup_db(db)
+        if ok:
+            ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+            await update.message.reply_text(f"💾 Бэкап создан: {ts}")
+            audit_record(uid, update.effective_user.first_name, "backup", "Ручной бэкап")
+        else:
+            await update.message.reply_text("❌ Ошибка при создании бэкапа. Проверьте GITHUB_TOKEN и настройки.")
+    except Exception as e:
+        log.error(f"Backup error: {e}")
+        await update.message.reply_text("⚠️ Ошибка при создании бэкапа.")
+
+async def cmd_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Задать лимит: /limit расходы 100000"""
+    uid = update.effective_user.id
+    role = get_user_role(uid)
+    if role not in ("admin", "accountant"):
+        await update.message.reply_text("❌ Только администратор или бухгалтер может задавать лимиты.")
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "📊 Использование: /limit <название> <сумма>\n\n"
+            "Примеры:\n/limit расходы 100000\n/limit зарплата 50000"
+        )
+        return
+    name = args[0]
+    try:
+        amount = float(args[1].replace(",", "").replace(" ", ""))
+    except ValueError:
+        await update.message.reply_text("❌ Сумма должна быть числом.")
+        return
+    _budget_limits[name] = amount
+    await update.message.reply_text(f"✅ Лимит установлен: *{_esc(name)}* = {_esc(fmt(amount))} сом", parse_mode=ParseMode.MARKDOWN_V2)
+    audit_record(uid, update.effective_user.first_name, "set_limit", f"{name} = {fmt(amount)}")
+
+async def cmd_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """QR-код для оплаты: /qr <контрагент>"""
+    text = " ".join(context.args).strip() if context.args else ""
+    if not text:
+        await update.message.reply_text("🔲 Использование: /qr <контрагент>\nНапример: /qr Альфа Трейд")
+        return
+    await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
+    try:
+        db = fetch_db()
+        contractor = _find_contractor_requisites(db, text.lower())
+        if not contractor:
+            await update.message.reply_text(f"❌ Контрагент «{text}» не найден.")
+            return
+        # Формируем данные для QR
+        name = contractor.get("name", "")
+        inn = contractor.get("inn", contractor.get("INN", ""))
+        account = contractor.get("account", contractor.get("bankAccount", ""))
+        bank = contractor.get("bank", contractor.get("bankName", ""))
+        bik = contractor.get("bik", contractor.get("BIK", ""))
+        qr_data = f"Оплата: {name}"
+        if inn:
+            qr_data += f"\nИНН: {inn}"
+        if account:
+            qr_data += f"\nСчёт: {account}"
+        if bank:
+            qr_data += f"\nБанк: {bank}"
+        if bik:
+            qr_data += f"\nБИК: {bik}"
+
+        qr_bytes = _generate_qr(qr_data)
+        caption = f"🔲 QR для оплаты: {name}"
+        if inn:
+            caption += f"\nИНН: {inn}"
+        if account:
+            caption += f"\nСчёт: {account}"
+        await update.message.chat.send_photo(photo=qr_bytes, caption=caption)
+    except Exception as e:
+        log.error(f"QR error: {e}")
+        await update.message.reply_text("⚠️ Ошибка при генерации QR-кода.")
 
 
 async def _send_chart(chat, chart_bytes: bytes | None, caption: str, no_data_msg: str):
@@ -2319,6 +2849,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup(buttons)
         await chat.send_message("⭐ *Избранные запросы:*", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
 
+    elif data == "cmd:pdf":
+        await chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        try:
+            db = fetch_db()
+            pdf_bytes = _generate_pdf_report(db)
+            if pdf_bytes:
+                today = datetime.now().strftime("%Y-%m-%d")
+                await chat.send_document(document=pdf_bytes, filename=f"Отчёт_{today}.pdf", caption="📄 PDF-отчёт")
+            else:
+                await chat.send_message("❌ Не удалось создать отчёт.")
+        except Exception as e:
+            log.error(f"PDF callback error: {e}")
+            await chat.send_message("⚠️ Ошибка при создании PDF.")
+
     elif data.startswith("xlsx:"):
         await chat.send_action(ChatAction.UPLOAD_DOCUMENT)
         try:
@@ -2348,6 +2892,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.chat.send_action(ChatAction.TYPING)
     text_lower = text.lower().strip()
+
+    # ── Аудит: запись запроса ──
+    audit_record(user_id, user_name, "query", text[:100])
+
+    # ── Напоминания (текстом) ──
+    remind_kw = ["напомни", "remind", "эскерт"]
+    if any(text_lower.startswith(k) for k in remind_kw):
+        when, reminder_text = _parse_reminder(text)
+        if when is not None:
+            if isinstance(when, timedelta):
+                fire_at = datetime.now() + when
+                delay = when.total_seconds()
+            else:
+                fire_at = when
+                delay = (when - datetime.now()).total_seconds()
+            if delay > 0:
+                job_name = f"rem_{user_id}_{int(time.time())}"
+                context.application.job_queue.run_once(
+                    _fire_reminder, when=delay,
+                    data={"chat_id": update.effective_chat.id, "text": reminder_text, "user_id": user_id},
+                    name=job_name,
+                )
+                _reminders.setdefault(user_id, []).append({"text": reminder_text, "at": fire_at, "job_name": job_name})
+                time_str = fire_at.strftime("%d.%m.%Y %H:%M")
+                await update.message.reply_text(
+                    f"🔔 Напоминание установлено на *{_esc(time_str)}*\n\n_{_esc(reminder_text)}_",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+                return
 
     # ── Ввод данных ──
     input_kw = ["приход ", "расход ", "поступление ", "реализация "]
@@ -2620,6 +3193,25 @@ async def check_notifications(context: ContextTypes.DEFAULT_TYPE):
                     log.warning(f"Notify error chat {chat_id}: {e}")
             _last_low_balance_alert = now
 
+    # 3. Бюджетные алерты
+    budget_alerts = _check_budget_alerts(db)
+    if budget_alerts:
+        msg = "📊 *Бюджетные алерты:*\n\n" + "\n".join(budget_alerts)
+        for chat_id in _notify_chat_ids:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=msg)
+            except Exception:
+                pass
+
+    # 4. Авто-бэкап (раз в сутки)
+    global _last_backup_time
+    if now - _last_backup_time > 86400:  # 24 часа
+        _backup_db(db)
+        _last_backup_time = now
+
+
+_last_backup_time = 0.0
+
 
 # ══════════════════════════════════════════════
 #  Запуск
@@ -2633,6 +3225,12 @@ async def post_init(app: Application):
         BotCommand("lang", "Сменить язык / Тил / Language"),
         BotCommand("save", "Сохранить запрос в избранное"),
         BotCommand("fav", "Избранные запросы"),
+        BotCommand("remind", "Напоминание"),
+        BotCommand("reminders", "Мои напоминания"),
+        BotCommand("pdf", "PDF-отчёт"),
+        BotCommand("backup", "Резервная копия"),
+        BotCommand("limit", "Задать лимит бюджета"),
+        BotCommand("qr", "QR-код для оплаты"),
     ])
     log.info("Команды бота зарегистрированы")
 
@@ -2654,6 +3252,12 @@ def main():
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CommandHandler("save", cmd_save))
     app.add_handler(CommandHandler("fav", cmd_fav))
+    app.add_handler(CommandHandler("remind", cmd_remind))
+    app.add_handler(CommandHandler("reminders", cmd_reminders))
+    app.add_handler(CommandHandler("pdf", cmd_pdf))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("limit", cmd_limit))
+    app.add_handler(CommandHandler("qr", cmd_qr))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
