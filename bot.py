@@ -116,10 +116,18 @@ def clean_search(text: str, extra_stops: list = None) -> str:
 # =============================================
 
 def get_account_name(db, acc_id):
+    """acc_id может быть 'bank:_1' или 'cash:_1' или просто '_1'."""
+    raw_id = acc_id.split(":", 1)[-1] if ":" in acc_id else acc_id
+    prefix = acc_id.split(":", 1)[0] if ":" in acc_id else ""
     for a in db.get("accounts", []):
-        if a["id"] == acc_id:
-            return a.get("name", acc_id)
-    return acc_id or "Без счёта"
+        if a["id"] == raw_id:
+            return a.get("name", raw_id)
+    # Ищем в кассах
+    if prefix == "cash":
+        for c in db.get("cashs", []):
+            if c["id"] == raw_id:
+                return c.get("name", raw_id)
+    return raw_id or "Без счёта"
 
 def get_warehouse_name(db, wh_id):
     for w in db.get("trade", {}).get("warehouses", []):
@@ -171,21 +179,22 @@ def calc_stock(db):
 
 
 def calc_balances(db):
+    """Возвращает { 'bank:_1': сумма, 'cash:_1': сумма } — ключи с префиксом чтобы не путать банк и кассу."""
     balances = {}
     for doc in db.get("bankDocuments", []):
-        acc = doc.get("account", "")
+        key = "bank:" + doc.get("account", "")
         s = float(doc.get("sum", 0))
         if doc.get("type") == "payment_in":
-            balances[acc] = balances.get(acc, 0) + s
+            balances[key] = balances.get(key, 0) + s
         elif doc.get("type") == "payment_out":
-            balances[acc] = balances.get(acc, 0) - s
+            balances[key] = balances.get(key, 0) - s
     for doc in db.get("cashDocuments", []):
-        acc = doc.get("cash", doc.get("account", ""))
+        key = "cash:" + doc.get("cash", doc.get("account", ""))
         s = float(doc.get("sum", 0))
         if doc.get("type") in ("cash_in", "pko"):
-            balances[acc] = balances.get(acc, 0) + s
+            balances[key] = balances.get(key, 0) + s
         elif doc.get("type") in ("cash_out", "rko"):
-            balances[acc] = balances.get(acc, 0) - s
+            balances[key] = balances.get(key, 0) - s
     return balances
 
 
